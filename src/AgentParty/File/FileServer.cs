@@ -14,6 +14,7 @@ public class FileServer : IServer
     private bool _disposed;
 
     public event Action<IMessage>? MessageReceived;
+    public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
     public FileServer(FileServerConfig config)
     {

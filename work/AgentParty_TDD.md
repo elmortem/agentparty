@@ -2,9 +2,11 @@
 
 ## 1. Overview
 
-**AgentParty** — библиотека для организации коммуникации с LLM-агентами через сменные транспорты. Предоставляет единый интерфейс для отправки и получения сообщений независимо от способа доставки (Telegram, файловая система, в будущем — REST, WebSocket и др.).
+**AgentParty** — библиотека для организации коммуникации с LLM-агентами через сменные транспорты. Предоставляет единый интерфейс для отправки и получения типизированных сообщений независимо от способа доставки (Telegram, консоль, файловая система, в будущем — REST, WebSocket и др.).
 
-Библиотека не занимается оркестрацией, маршрутизацией задач или управлением сессиями — это ответственность потребляющего кода. AgentParty — чистый транспортный слой.
+Библиотека отвечает за транспорт и формат отображения. Каждый транспорт знает, как рендерить типизированные сообщения в своём формате (Telegram — inline-кнопками, Console — текстовым меню, File — JSON-конвертом).
+
+Библиотека **не занимается** оркестрацией, маршрутизацией задач, управлением сессиями или бизнес-логикой агентов — это ответственность потребляющего кода.
 
 - **Target Framework:** .NET 8
 - **Лицензия:** MIT
@@ -13,10 +15,10 @@
 
 ## 2. Основные понятия
 
-- **Server** — точка приёма сообщений. Живёт внутри агента. Слушает входящие сообщения от клиентов и может отправлять сообщения конкретному клиенту по его `clientId`.
-- **Client** — точка подключения к агенту. Может отправлять сообщения серверу и получать от него ответы.
-- **Router** — композитный сервер. Реализует `IServer`, агрегирует несколько серверов. Хранит таблицу маршрутизации `clientId → IServer` и автоматически направляет исходящие сообщения в нужный сервер. Агент подписывается на Router один раз и работает с единой точкой входа.
-- **Message** — единица обмена. Чистый DTO без поведения.
+- **Server** — точка приёма сообщений. Живёт внутри агента. Слушает входящие сообщения от клиентов и может отправлять сообщения конкретному клиенту по его `clientId`. Знает, как рендерить типизированные сообщения в формате своего транспорта.
+- **Client** — точка подключения к агенту. Может отправлять сообщения серверу и получать от него ответы. Знает, как рендерить входящие типизированные сообщения и собирать ответы пользователя.
+- **Router** — композитный сервер. Реализует `IServer`, агрегирует несколько серверов. Хранит таблицу маршрутизации `clientId → IServer` и автоматически направляет исходящие сообщения в нужный сервер. Фильтрует команды по whitelist'у серверов. Агент подписывается на Router один раз и работает с единой точкой входа.
+- **Message** — единица обмена. Типизированный DTO без поведения.
 
 ## 3. Интерфейсы
 
@@ -35,10 +37,10 @@ public interface IMessage
 
 Поля:
 - `Id` — уникальный идентификатор сообщения (GUID).
-- `Type` — тип сообщения. На старте — `"message"`. В будущем — `"tool_call"`, `"tool_result"` и т.д.
-- `Content` — текстовое содержимое.
+- `Type` — тип сообщения (см. раздел 4).
+- `Content` — содержимое. Для `"text"` — строка. Для остальных типов — JSON.
 - `ClientId` — идентификатор клиента-отправителя (для входящих) или клиента-получателя (для исходящих).
-- `Timestamp` — время создания сообщения.
+- `Timestamp` — время создания сообщения (UTC).
 
 ### 3.2. IServer
 
@@ -47,6 +49,8 @@ public interface IServer : IDisposable
 {
     event Action<IMessage> MessageReceived;
     
+    HashSet<string> AllowedCommands { get; }
+    
     Task StartAsync(CancellationToken cancellationToken = default);
     Task StopAsync(CancellationToken cancellationToken = default);
     Task SendAsync(string clientId, IMessage message, CancellationToken cancellationToken = default);
@@ -54,8 +58,9 @@ public interface IServer : IDisposable
 ```
 
 - `MessageReceived` — событие, которое вызывается при получении сообщения от клиента.
-- `StartAsync` / `StopAsync` — управление жизненным циклом (запуск polling/watcher, подключение к Telegram и т.д.).
-- `SendAsync` — отправка сообщения конкретному клиенту по его `clientId`.
+- `AllowedCommands` — whitelist разрешённых команд для этого сервера. Пустой — команды запрещены. Router фильтрует входящие `"command"` сообщения по этому списку.
+- `StartAsync` / `StopAsync` — управление жизненным циклом.
+- `SendAsync` — отправка сообщения конкретному клиенту. Сервер рендерит типизированное сообщение в формате своего транспорта.
 
 ### 3.3. IClient
 
@@ -70,11 +75,182 @@ public interface IClient : IDisposable
 }
 ```
 
-- `MessageReceived` — событие, которое вызывается при получении сообщения от сервера.
+- `MessageReceived` — событие, которое вызывается при получении сообщения от сервера. Клиент рендерит типизированное сообщение и может собрать ответ пользователя.
 - `ConnectAsync` / `DisconnectAsync` — управление подключением.
 - `SendAsync` — отправка сообщения серверу. `ClientId` в сообщении заполняется клиентом автоматически.
 
-## 4. Router
+## 4. Типы сообщений
+
+### 4.1. `"text"` — простой текст
+
+Content — строка. Может содержать Markdown.
+
+```json
+{
+    "id": "...",
+    "type": "text",
+    "content": "Привет! Вот **список** изменений.",
+    "clientId": "...",
+    "timestamp": "..."
+}
+```
+
+Рендеринг:
+- **TelegramServer** — Markdown через Telegram Bot API.
+- **ConsoleServer/Client** — текст как есть (Markdown strip или as-is).
+- **FileServer/Client** — JSON конверт.
+
+### 4.2. `"choice"` — вопрос с вариантами выбора
+
+Content — JSON. Ожидает ответ (`"response"`).
+
+```json
+{
+    "id": "abc-123",
+    "type": "choice",
+    "content": "{\"text\": \"Выполняем?\", \"options\": [\"Да\", \"Нет\", \"Обсудим\"]}",
+    "clientId": "...",
+    "timestamp": "..."
+}
+```
+
+Рендеринг:
+- **TelegramServer** — текст + inline-кнопки.
+- **ConsoleServer/Client** — текст + нумерованный список, ожидание ввода номера.
+- **FileServer/Client** — JSON конверт as-is.
+
+### 4.3. `"list"` — список элементов
+
+Content — JSON. Каждый элемент может иметь свои действия (или не иметь). Если хотя бы у одного элемента есть действия — ожидает ответ (`"response"`). Если ни у одного нет действий — информационный, ответа не ждёт.
+
+```json
+{
+    "id": "list-456",
+    "type": "list",
+    "content": "{\"title\": \"Задачи на сегодня\", \"items\": [{\"id\": \"1\", \"text\": \"Сделать AI врагов\", \"details\": \"SHOOTER-045, приоритет high\", \"actions\": [{\"id\": \"create\", \"label\": \"Создать\"}, {\"id\": \"skip\", \"label\": \"Пропустить\"}]}, {\"id\": \"2\", \"text\": \"Пофиксить баг #42\"}, {\"id\": \"3\", \"text\": \"Рефакторинг\", \"actions\": [{\"id\": \"discuss\", \"label\": \"Обсудить\"}]}]}",
+    "clientId": "...",
+    "timestamp": "..."
+}
+```
+
+Структура Content:
+```
+{
+    "title": string?,          // заголовок списка (опционален)
+    "items": [
+        {
+            "id": string,      // идентификатор элемента
+            "text": string,    // основной текст
+            "details": string?, // дополнительные детали (опционально)
+            "actions": [       // действия для этого элемента (опционально)
+                {
+                    "id": string,    // идентификатор действия
+                    "label": string  // текст кнопки/пункта
+                }
+            ]?
+        }
+    ]
+}
+```
+
+Рендеринг:
+- **TelegramServer** — сообщение со списком. Элементы с actions рендерятся как карточки с inline-кнопками. Элементы без actions — просто текстом.
+- **ConsoleServer/Client** — нумерованный список. Для элементов с actions — предложение ввести `номер.действие`.
+- **FileServer/Client** — JSON конверт as-is.
+
+Паттерн "confirm plan": отправить `"list"` без actions (информационный список изменений), затем `"choice"` с вариантами "Да / Нет / Обсудим". Так реализуются подтверждения без специального типа сообщений.
+
+### 4.4. `"notification"` — мягкая нотификация
+
+Content — JSON. Не ждёт ответа. Каждый транспорт решает, как отобразить (или проигнорировать).
+
+```json
+{
+    "id": "...",
+    "type": "notification",
+    "content": "{\"kind\": \"thinking\"}",
+    "clientId": "...",
+    "timestamp": "..."
+}
+```
+
+Виды (`kind`):
+- `"thinking"` — агент обрабатывает запрос. TelegramServer показывает typing action. ConsoleServer/Client может показать "...". FileServer — игнорирует.
+- `"attention"` — у агента есть что-то требующее внимания (например, накопились вопросы). TelegramServer может менять имя бота (`setMyName`). ConsoleServer/Client — маркер в prompt. FileServer — файл-флаг.
+- `"attention_clear"` — сброс attention-нотификации.
+
+Транспорт, не знающий конкретный `kind`, просто игнорирует сообщение.
+
+### 4.5. `"command"` — команда
+
+Content — JSON. Фильтруется Router'ом через whitelist сервера-источника.
+
+```json
+{
+    "id": "...",
+    "type": "command",
+    "content": "{\"name\": \"status\", \"args\": [\"project1\"]}",
+    "clientId": "...",
+    "timestamp": "..."
+}
+```
+
+Структура Content:
+```
+{
+    "name": string,      // имя команды
+    "args": string[]?    // аргументы (опционально)
+}
+```
+
+Команды не обрабатываются транспортным слоем. Router проверяет whitelist, и если команда разрешена — пробрасывает через `MessageReceived`. Интерпретация — на стороне потребляющего кода (агента).
+
+### 4.6. `"response"` — ответ на сообщение
+
+Content — JSON. Корреляция с исходным сообщением через поле `to`.
+
+```json
+{
+    "id": "...",
+    "type": "response",
+    "content": "{\"to\": \"abc-123\", \"value\": \"Да\"}",
+    "clientId": "...",
+    "timestamp": "..."
+}
+```
+
+Для `"choice"`:
+```
+{"to": "msg-id", "value": "выбранный вариант"}
+```
+
+Для `"list"` (с actions):
+```
+{"to": "msg-id", "items": [{"id": "1", "action": "create"}, {"id": "3", "action": "discuss"}]}
+```
+
+Для свободного текстового ответа (пользователь ответил не кнопкой, а текстом):
+```
+{"to": "msg-id", "value": "произвольный текст"}
+```
+
+Не важно, кто отвечает — человек через Telegram, другой агент через FileClient, или stdin через ConsoleClient. Протокол одинаковый.
+
+### 4.7. `"message"` — legacy / нетипизированное сообщение
+
+Для обратной совместимости и для случаев, когда клиент отправляет обычное текстовое сообщение агенту (пользователь написал в чат). Это входящее сообщение, не путать с `"text"` (исходящее от агента).
+
+```json
+{
+    "id": "...",
+    "type": "message",
+    "content": "Покажи задачи по shooter",
+    "clientId": "...",
+    "timestamp": "..."
+}
+```
+
+## 5. Router
 
 ```csharp
 public class Router : IServer
@@ -83,6 +259,7 @@ public class Router : IServer
     public void Unregister(IServer server);
     
     // IServer implementation
+    public HashSet<string> AllowedCommands { get; }
     public event Action<IMessage> MessageReceived;
     public Task StartAsync(CancellationToken cancellationToken = default);
     public Task StopAsync(CancellationToken cancellationToken = default);
@@ -94,17 +271,19 @@ public class Router : IServer
 
 - `Register(server)` — подписывается на `server.MessageReceived`. При получении сообщения от зарегистрированного сервера:
   1. Запоминает в таблице маршрутизации: `message.ClientId → server`.
-  2. Пробрасывает сообщение через собственный `MessageReceived`.
-- `SendAsync(clientId, message)` — находит сервер по таблице маршрутизации и вызывает `server.SendAsync(clientId, message)`. Если `clientId` не найден — выбрасывает исключение.
+  2. Если сообщение `Type = "command"` — проверяет `server.AllowedCommands`. Если команда не в whitelist'е — дропает сообщение с логированием, отправляет клиенту `"text"` с сообщением об ошибке.
+  3. Пробрасывает сообщение через собственный `MessageReceived`.
+- `SendAsync(clientId, message)` — находит сервер по таблице маршрутизации и вызывает `server.SendAsync(clientId, message)`. Если `clientId` не найден — выбрасывает `KeyNotFoundException`.
 - `StartAsync` / `StopAsync` — вызывает соответствующие методы у всех зарегистрированных серверов.
+- `AllowedCommands` Router'а — объединение AllowedCommands всех зарегистрированных серверов (информационное, фильтрация происходит на уровне конкретного сервера-источника).
 
 ### Коллизии clientId
 
-На практике коллизии маловероятны: Telegram использует числовые chat_id, файловый клиент — GUID. При обнаружении коллизии (два сервера регистрируют одинаковый clientId) — логируем warning и перезаписываем маршрут (last-write-wins). Это сознательный trade-off простоты.
+На практике коллизии маловероятны: Telegram использует числовые chat_id, файловый клиент — GUID, консольный — "console" или конфигурируемый. При обнаружении коллизии (два сервера регистрируют одинаковый clientId) — логируем warning и перезаписываем маршрут (last-write-wins).
 
-## 5. Реализации
+## 6. Реализации
 
-### 5.1. FileServer / FileClient
+### 6.1. FileServer / FileClient
 
 Файловая реализация использует shared folder для обмена сообщениями. Один файл — одно сообщение в формате JSON (envelope). Файл удаляется после прочтения.
 
@@ -113,14 +292,15 @@ public class Router : IServer
 ```csharp
 public class FileServerConfig
 {
-    public string Directory { get; set; }          // корневая папка
-    public int PollingIntervalMs { get; set; } = 5000; // fallback polling
+    public string Directory { get; set; }
+    public int PollingIntervalMs { get; set; } = 5000;
+    public HashSet<string> AllowedCommands { get; set; } = new();
 }
 
 public class FileClientConfig
 {
-    public string Directory { get; set; }          // та же корневая папка
-    public string ClientId { get; set; }           // идентификатор клиента
+    public string Directory { get; set; }
+    public string ClientId { get; set; }
     public int PollingIntervalMs { get; set; } = 5000;
 }
 ```
@@ -138,15 +318,21 @@ public class FileClientConfig
 
 #### Формат файла (envelope)
 
+Все типы сообщений сериализуются в единый JSON-формат. Content всегда строка (для structured типов — JSON-строка).
+
 ```json
 {
     "id": "550e8400-e29b-41d4-a716-446655440000",
-    "type": "message",
-    "content": "Привет, как дела?",
+    "type": "choice",
+    "content": "{\"text\": \"Продолжаем?\", \"options\": [\"Да\", \"Нет\"]}",
     "clientId": "client-abc-123",
     "timestamp": "2026-04-14T12:00:00Z"
 }
 ```
+
+#### Рендеринг типизированных сообщений
+
+FileServer/FileClient **не рендерят** — передают JSON as-is. Интерпретация на стороне потребителя файлового транспорта (другой агент, скрипт, UI).
 
 #### Атомарность записи
 
@@ -164,9 +350,9 @@ FileSystemWatcher фильтрует по `*.json`, поэтому `.tmp` фай
 
 В `outgoing/` лежат файлы для всех клиентов. Каждый клиент при polling/watch читает все файлы, но обрабатывает и удаляет только те, где `clientId` совпадает с его собственным. Чужие файлы не трогает.
 
-### 5.2. TelegramServer
+### 6.2. TelegramServer
 
-Адаптер над `Telegram.Bot`. Выступает как сервер — слушает входящие сообщения от пользователей Telegram и может отвечать им.
+Адаптер над `Telegram.Bot`. Выступает как сервер — слушает входящие сообщения и callback_query от пользователей Telegram, отправляет типизированные сообщения с рендерингом в Telegram-формат.
 
 #### Конфигурация
 
@@ -174,25 +360,94 @@ FileSystemWatcher фильтрует по `*.json`, поэтому `.tmp` фай
 public class TelegramServerConfig
 {
     public string BotToken { get; set; }
+    public HashSet<string> AllowedCommands { get; set; } = new();
 }
 ```
 
-#### Маппинг
+#### Маппинг входящих
 
 - `clientId` = `chatId.ToString()` (Telegram chat ID).
-- Входящие `Update` с текстовым сообщением → `IMessage` с `ClientId = chatId`, `Content = text`, `Type = "message"`.
-- `SendAsync(clientId, message)` → `botClient.SendMessage(long.Parse(clientId), message.Content)`.
+- Текстовое сообщение → `IMessage` с `Type = "message"`, `Content = text`.
+- Callback query (нажатие inline-кнопки) → `IMessage` с `Type = "response"`, `Content = JSON` с `to` (id исходного сообщения) и `value`/`items` в зависимости от контекста. TelegramServer хранит маппинг отправленных сообщений, чтобы связать callback_query с исходным message id.
+
+#### Рендеринг исходящих
+
+| Тип | Рендеринг |
+|-----|-----------|
+| `text` | Markdown через `SendMessage` |
+| `choice` | Текст + `InlineKeyboardMarkup` с кнопками по одной на вариант |
+| `list` (info only) | Форматированный текст со списком |
+| `list` (с actions) | Каждый элемент с actions → отдельное сообщение с inline-кнопками. Элементы без actions — в общем текстовом сообщении |
+| `notification` (thinking) | `SendChatAction(Typing)` |
+| `notification` (attention) | `SetMyName("ПМ 📌")` или аналогичное |
+| `notification` (attention_clear) | `SetMyName("ПМ")` — возврат к обычному имени |
+| `command` | Не рендерится (команды — входящие) |
+| `response` | Не рендерится (ответы — входящие) |
 
 #### Lifecycle
 
-- `StartAsync` — запускает polling через `TelegramBotClient.ReceiveAsync` или аналогичный механизм.
+- `StartAsync` — запускает polling через `TelegramBotClient.ReceiveAsync`.
 - `StopAsync` — останавливает polling через `CancellationToken`.
 
-### 5.3. TelegramClient
+### 6.3. TelegramClient
 
-TelegramClient не реализуется. Telegram и так предоставляет клиент — сам Telegram-мессенджер. Пользователь пишет боту из Telegram, это и есть клиент.
+TelegramClient не реализуется. Telegram-мессенджер и есть клиент.
 
-## 6. Структура проекта
+### 6.4. ConsoleServer / ConsoleClient
+
+Консольная реализация через stdin/stdout. ConsoleServer и ConsoleClient запускаются в одном процессе — Server слушает stdin (входящие от пользователя), Client пишет в stdout (ответы от агента). Используется для CLI-режима.
+
+#### Конфигурация
+
+```csharp
+public class ConsoleServerConfig
+{
+    public string ClientId { get; set; } = "console";
+    public HashSet<string> AllowedCommands { get; set; } = new();
+    public string[] StartupCommands { get; set; } = [];
+}
+
+public class ConsoleClientConfig
+{
+    public string ClientId { get; set; } = "console";
+}
+```
+
+`StartupCommands` — команды, которые ConsoleServer отправляет при старте (из аргументов командной строки, переданных приложением). Каждая команда отправляется как `Type = "command"`.
+
+#### ConsoleServer (stdin → agent)
+
+- `StartAsync` — начинает слушать stdin в фоновом потоке. При получении строки:
+  - Если начинается с `/` — формирует `"command"` сообщение (парсит `/name arg1 arg2` → `{name, args}`).
+  - Иначе — формирует `"message"` сообщение.
+  - Отправляет startup commands при первом старте.
+- `StopAsync` — останавливает чтение stdin.
+- `SendAsync` — рендерит типизированное сообщение в stdout (см. таблицу рендеринга).
+- `AllowedCommands` — whitelist из конфига. Определяет, какие команды пользователь может отправлять из консоли.
+
+#### Рендеринг (ConsoleServer.SendAsync → stdout)
+
+| Тип | Рендеринг |
+|-----|-----------|
+| `text` | Markdown strip + вывод текста. Заголовки — CAPS, bold — без маркеров, списки — as-is |
+| `choice` | Текст + нумерованный список вариантов. Запрос ввода номера |
+| `list` (info only) | Нумерованный список с details |
+| `list` (с actions) | Нумерованный список. Для элементов с actions: `[номер] текст → [действие1/действие2]`. Запрос ввода `номер.действие` |
+| `notification` (thinking) | `"..."` или `"[Думаю...]"` |
+| `notification` (attention) | `"[!]"` добавляется к prompt'у |
+| `notification` (attention_clear) | Убирает `"[!]"` из prompt'а |
+
+При получении ввода от пользователя в ответ на `choice` или `list` — ConsoleServer формирует `"response"` сообщение и отправляет его как входящее (через `MessageReceived`).
+
+#### ConsoleClient (stdout ← agent)
+
+Зеркальная роль: используется, когда внешнее приложение подключается к агенту через stdin/stdout. Не для CLI-режима самого агента, а для программного взаимодействия (pipe).
+
+- `ConnectAsync` — начинает слушать stdin для входящих сообщений от сервера.
+- `SendAsync` — пишет JSON-конверт в stdout.
+- `MessageReceived` — срабатывает при получении JSON-конверта из stdin.
+
+## 7. Структура проекта
 
 ```
 AgentParty/
@@ -204,63 +459,159 @@ AgentParty/
       IClient.cs
       Message.cs                    ← реализация IMessage
       Router.cs
+      MessageTypes.cs               ← константы типов ("text", "choice", etc.)
+      Content/                      ← модели Content для типизированных сообщений
+        ChoiceContent.cs            ← {text, options}
+        ListContent.cs              ← {title, items[{id, text, details, actions}]}
+        NotificationContent.cs      ← {kind}
+        CommandContent.cs           ← {name, args}
+        ResponseContent.cs          ← {to, value?, items?}
       File/
         FileServer.cs
         FileClient.cs
         FileServerConfig.cs
         FileClientConfig.cs
+      Console/
+        ConsoleServer.cs
+        ConsoleClient.cs
+        ConsoleServerConfig.cs
+        ConsoleClientConfig.cs
+        ConsoleRenderer.cs          ← рендеринг типизированных сообщений в текст
       Telegram/
         TelegramServer.cs
         TelegramServerConfig.cs
+        TelegramRenderer.cs         ← рендеринг типизированных сообщений в Telegram-формат
   tests/
     AgentParty.Tests/               ← xUnit тесты
 ```
 
 NuGet зависимости:
-- `AgentParty` (core): нет внешних зависимостей для файловой реализации.
+- `AgentParty` (core): нет внешних зависимостей для файловой и консольной реализации.
 - `AgentParty` включает Telegram: `Telegram.Bot` >= 22.0.
 
 Если в будущем Telegram-зависимость станет нежелательной — выносим в отдельный пакет `AgentParty.Telegram`.
 
-## 7. Пример использования
+## 8. Пример использования
 
-### Сторона агента (сервер)
+### Сторона агента (сервер с несколькими транспортами)
 
 ```csharp
-// Создаём серверы
 var telegramServer = new TelegramServer(new TelegramServerConfig 
 { 
-    BotToken = "123456:ABC-DEF" 
+    BotToken = "123456:ABC-DEF",
+    AllowedCommands = new() { "status", "help" }
+});
+
+var consoleServer = new ConsoleServer(new ConsoleServerConfig
+{
+    ClientId = "console",
+    AllowedCommands = new() { "setup", "status", "help", "shutdown" },
+    StartupCommands = startupCommands // из аргументов командной строки
 });
 
 var fileServer = new FileServer(new FileServerConfig 
 { 
-    Directory = "/tmp/agent-pm" 
+    Directory = "/tmp/agent-pm",
+    AllowedCommands = new() { "status" }
 });
 
-// Объединяем через Router
 var router = new Router();
 router.Register(telegramServer);
+router.Register(consoleServer);
 router.Register(fileServer);
 
-// Подписываемся на единый поток
-router.MessageReceived += message =>
+router.MessageReceived += async message =>
 {
-    Console.WriteLine($"[{message.ClientId}]: {message.Content}");
-    
-    // Отвечаем — Router сам найдёт нужный сервер
-    var reply = new Message
+    switch (message.Type)
     {
-        Id = Guid.NewGuid().ToString(),
-        Type = "message",
-        Content = "Понял, работаю...",
-        ClientId = message.ClientId,
-        Timestamp = DateTime.UtcNow
-    };
-    router.SendAsync(message.ClientId, reply);
+        case MessageTypes.Message:
+            // Обычное сообщение от пользователя → в AgentLoop
+            await agentLoop.ProcessMessage(message.ClientId, message.Content);
+            break;
+            
+        case MessageTypes.Command:
+            // Команда (уже прошла whitelist-фильтрацию в Router)
+            var cmd = CommandContent.Parse(message.Content);
+            await commandHandler.Handle(message.ClientId, cmd.Name, cmd.Args);
+            break;
+            
+        case MessageTypes.Response:
+            // Ответ на choice/list → доставить в ожидающий AgentLoop
+            var resp = ResponseContent.Parse(message.Content);
+            agentLoop.ProvideResponse(message.ClientId, resp);
+            break;
+    }
 };
 
 await router.StartAsync();
+```
+
+### Отправка типизированных сообщений агентом
+
+```csharp
+// Простой текст
+await router.SendAsync(clientId, new Message
+{
+    Type = MessageTypes.Text,
+    Content = "Создал 3 задачи в проекте Shooter.",
+    ClientId = clientId
+});
+
+// Выбор (ожидает ответ)
+await router.SendAsync(clientId, new Message
+{
+    Id = "confirm-001",
+    Type = MessageTypes.Choice,
+    Content = JsonSerializer.Serialize(new ChoiceContent
+    {
+        Text = "Выполняем?",
+        Options = ["Да", "Нет", "Обсудим"]
+    }),
+    ClientId = clientId
+});
+
+// Информационный список (без actions, не ждёт ответ)
+await router.SendAsync(clientId, new Message
+{
+    Type = MessageTypes.List,
+    Content = JsonSerializer.Serialize(new ListContent
+    {
+        Title = "План изменений",
+        Items = [
+            new ListItem { Id = "1", Text = "Создать задачу: AI врагов" },
+            new ListItem { Id = "2", Text = "Создать задачу: Спавн волн" },
+            new ListItem { Id = "3", Text = "Обновить приоритет SHOOTER-042" }
+        ]
+    }),
+    ClientId = clientId
+});
+
+// Список с действиями (ждёт ответ)
+await router.SendAsync(clientId, new Message
+{
+    Id = "decomp-001",
+    Type = MessageTypes.List,
+    Content = JsonSerializer.Serialize(new ListContent
+    {
+        Title = "Предложенные задачи",
+        Items = [
+            new ListItem 
+            { 
+                Id = "1", Text = "AI поведение врагов",
+                Actions = [new ListAction { Id = "create", Label = "Создать" }, 
+                           new ListAction { Id = "discuss", Label = "Обсудить" },
+                           new ListAction { Id = "skip", Label = "Не нужно" }]
+            },
+            new ListItem 
+            { 
+                Id = "2", Text = "Спавн волн",
+                Actions = [new ListAction { Id = "create", Label = "Создать" },
+                           new ListAction { Id = "skip", Label = "Не нужно" }]
+            }
+        ]
+    }),
+    ClientId = clientId
+});
 ```
 
 ### Сторона вызывающего (файловый клиент)
@@ -274,24 +625,35 @@ var client = new FileClient(new FileClientConfig
 
 client.MessageReceived += message =>
 {
-    Console.WriteLine($"Агент ответил: {message.Content}");
+    Console.WriteLine($"Агент ответил [{message.Type}]: {message.Content}");
 };
 
 await client.ConnectAsync();
 
+// Отправляем обычное сообщение
 await client.SendAsync(new Message
 {
-    Id = Guid.NewGuid().ToString(),
-    Type = "message",
+    Type = MessageTypes.Message,
     Content = "Нужен рефакторинг PlayerController",
-    ClientId = "coder-agent-001",
-    Timestamp = DateTime.UtcNow
+    ClientId = "coder-agent-001"
+});
+
+// Отправляем команду
+await client.SendAsync(new Message
+{
+    Type = MessageTypes.Command,
+    Content = JsonSerializer.Serialize(new CommandContent
+    {
+        Name = "status",
+        Args = ["shooter"]
+    }),
+    ClientId = "coder-agent-001"
 });
 ```
 
-## 8. Жизненный цикл и краевые случаи
+## 9. Жизненный цикл и краевые случаи
 
-### 8.1. Идемпотентность Start/Stop
+### 9.1. Идемпотентность Start/Stop
 
 `StartAsync` и `StopAsync` у всех реализаций (`IServer`, `IClient`) — **идемпотентны**. Повторный вызов — no-op. Реализации хранят внутренний флаг состояния (`_isRunning`).
 
@@ -303,7 +665,7 @@ await client.SendAsync(new Message
 | Stopped | `StopAsync` | No-op |
 | Stopped | `SendAsync` | `InvalidOperationException` |
 
-### 8.2. Router и регистрация серверов
+### 9.2. Router и регистрация серверов
 
 Router отслеживает своё состояние (`_isRunning`). Поведение `Register`/`Unregister` зависит от этого состояния.
 
@@ -316,35 +678,52 @@ Router отслеживает своё состояние (`_isRunning`). Пов
 - Router running + Unregister(server) → сервер удаляется, отписка, вызывается `server.StopAsync`. Маршруты этого сервера удаляются из таблицы маршрутизации.
 
 **StartAsync Router:**
-- Вызывает `StartAsync` у всех зарегистрированных серверов. Идемпотентность серверов гарантирует, что уже запущенные серверы не пострадают.
+- Вызывает `StartAsync` у всех зарегистрированных серверов.
 
 **StopAsync Router:**
 - Вызывает `StopAsync` у всех зарегистрированных серверов.
 
-### 8.3. Ошибки маршрутизации
+### 9.3. Фильтрация команд
+
+При получении сообщения с `Type = "command"` от зарегистрированного сервера:
+1. Router парсит `CommandContent.Name` из сообщения.
+2. Проверяет `server.AllowedCommands.Contains(name)`.
+3. Если разрешено — пробрасывает через `MessageReceived`.
+4. Если запрещено — логирует warning, отправляет клиенту `"text"` сообщение с ошибкой `"Команда '{name}' недоступна через этот канал"`.
+
+### 9.4. Ошибки маршрутизации
 
 - `Router.SendAsync` с неизвестным `clientId` → выбрасывает `KeyNotFoundException` с информативным сообщением.
 - Сервер, через который был зарегистрирован клиент, был удалён через `Unregister` → маршрут удалён, `SendAsync` выбросит `KeyNotFoundException`.
 
-### 8.4. Dispose
+### 9.5. Dispose
 
 - `Dispose` вызывает `StopAsync` синхронно если сервер/клиент был запущен.
 - Router при `Dispose` вызывает `StopAsync` и `Dispose` у всех зарегистрированных серверов, очищает таблицу маршрутизации. Если нужно сохранить сервер живым — сначала `Unregister`, потом `Dispose` роутера.
 
-## 9. Расширяемость
+## 10. Расширяемость
 
 ### Новые транспорты
 
-Для добавления нового транспорта достаточно реализовать `IServer` и/или `IClient`. Регистрация в Router — одна строка. Примеры будущих реализаций:
+Для добавления нового транспорта достаточно реализовать `IServer` и/или `IClient`, включая рендеринг типизированных сообщений. Регистрация в Router — одна строка.
+
+Примеры будущих реализаций:
 - `HttpServer` / `HttpClient` — REST-based.
 - `WebSocketServer` / `WebSocketClient` — для real-time.
-- `ConsoleServer` — stdin/stdout, для отладки.
 
 ### Новые типы сообщений
 
-Поле `Type` в `IMessage` зарезервировано для расширения. Транспортный слой передаёт его as-is. Интерпретация — на стороне потребителя. Возможные будущие типы: `"tool_call"`, `"tool_result"`, `"status"`, `"error"`.
+Типы сообщений расширяемы. Транспорт, не знающий конкретный тип, может:
+- Для исходящих: попытаться отрендерить Content как текст (fallback).
+- Для входящих: пробросить as-is через `MessageReceived`.
 
-## 10. CI/CD: GitHub Packages
+Потребляющий код определяет, какие типы он поддерживает. AgentParty предоставляет базовый набор (`text`, `choice`, `list`, `notification`, `command`, `response`, `message`), но не ограничивает этим.
+
+### Кастомные рендереры
+
+Каждый транспорт имеет свой Renderer (например, `TelegramRenderer`, `ConsoleRenderer`). Рендереры могут быть заменены через конфигурацию для кастомизации отображения.
+
+## 11. CI/CD: GitHub Packages
 
 ### Что делаем
 
@@ -364,16 +743,16 @@ Router отслеживает своё состояние (`_isRunning`). Пов
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <PackageId>AgentParty</PackageId>
-    <VersionPrefix>0.1</VersionPrefix> <!-- major.minor меняем руками, patch — автоинкремент из CI -->
+    <VersionPrefix>0.2</VersionPrefix>
     <Authors>elmortem</Authors>
-    <Description>Transport abstraction for LLM agent communication</Description>
+    <Description>Transport and rendering abstraction for LLM agent communication</Description>
     <RepositoryUrl>https://github.com/elmortem/AgentParty</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 </Project>
 ```
 
-Версия пакета формируется как `{VersionPrefix}.{github.run_number}` — например `0.1.1`, `0.1.2`, `0.1.37`. Patch растёт автоматически с каждым push. Для мажорных/минорных изменений — меняем `VersionPrefix` руками.
+Версия пакета формируется как `{VersionPrefix}.{github.run_number}` — например `0.2.1`, `0.2.2`, `0.2.37`. Patch растёт автоматически с каждым push. Для мажорных/минорных изменений — меняем `VersionPrefix` руками.
 
 ### GitHub Actions workflow
 
@@ -454,10 +833,12 @@ dotnet add package AgentParty
 </configuration>
 ```
 
-## 11. Ограничения и допущения
+## 12. Ограничения и допущения
 
 - Библиотека не управляет сессиями. Группировка сообщений в сессии, контексты, диалоги — ответственность потребляющего кода.
 - Файловый транспорт работает на доверии: клиент сам фильтрует свои сообщения, защиты от чтения чужих нет.
 - FileSystemWatcher может пропускать события при высокой нагрузке — periodic polling компенсирует.
 - Ordering гарантируется в пределах одного транспорта. Между разными транспортами (Telegram + File) порядок не гарантирован.
 - Коллизии `clientId` между транспортами маловероятны, но возможны. При коллизии — last-write-wins с логированием.
+- Транспорт, не поддерживающий конкретный тип сообщения, использует текстовый fallback для исходящих и пробрасывает as-is для входящих.
+- ConsoleServer/ConsoleClient рассчитаны на одного клиента. Для multi-client CLI — использовать FileServer/FileClient.

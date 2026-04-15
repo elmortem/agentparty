@@ -1,3 +1,6 @@
+using System.Text.Json;
+using AgentParty.Content;
+
 namespace AgentParty;
 
 public class Router : IServer
@@ -10,6 +13,17 @@ public class Router : IServer
 
     public event Action<IMessage>? MessageReceived;
 
+    public HashSet<string> AllowedCommands
+    {
+        get
+        {
+            var combined = new HashSet<string>();
+            foreach (var server in _servers)
+                combined.UnionWith(server.AllowedCommands);
+            return combined;
+        }
+    }
+
     public void Register(IServer server)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
@@ -19,6 +33,32 @@ public class Router : IServer
         Action<IMessage> handler = message =>
         {
             _routingTable[message.ClientId] = server;
+
+            if (message.Type == MessageTypes.Command)
+            {
+                try
+                {
+                    var cmd = CommandContent.Parse(message.Content);
+                    if (!server.AllowedCommands.Contains(cmd.Name))
+                    {
+                        // Command not in whitelist — send error to client
+                        var errorMsg = new Message
+                        {
+                            Type = MessageTypes.Text,
+                            Content = $"Command '{cmd.Name}' is not allowed on this channel",
+                            ClientId = message.ClientId
+                        };
+                        server.SendAsync(message.ClientId, errorMsg).GetAwaiter().GetResult();
+                        return;
+                    }
+                }
+                catch (JsonException)
+                {
+                    // Malformed command content — drop
+                    return;
+                }
+            }
+
             MessageReceived?.Invoke(message);
         };
         _handlers[server] = handler;

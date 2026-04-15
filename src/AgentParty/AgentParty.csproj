@@ -5,9 +5,9 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>AgentParty</PackageId>
-    <VersionPrefix>0.1</VersionPrefix>
+    <VersionPrefix>0.2</VersionPrefix>
     <Authors>elmortem</Authors>
-    <Description>Transport abstraction for LLM agent communication</Description>
+    <Description>Transport and rendering abstraction for LLM agent communication</Description>
     <RepositoryUrl>https://github.com/elmortem/AgentParty</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
