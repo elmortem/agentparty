@@ -8,10 +8,12 @@ public class Router : IServer
     private readonly List<IServer> _servers = new();
     private readonly Dictionary<string, IServer> _routingTable = new();
     private readonly Dictionary<IServer, Action<IMessage>> _handlers = new();
+    private readonly Dictionary<IServer, Action<IFeedMessage>> _feedHandlers = new();
     private bool _isRunning;
     private bool _disposed;
 
     public event Action<IMessage>? MessageReceived;
+    public event Action<IFeedMessage>? FeedReceived;
 
     public HashSet<string> AllowedCommands
     {
@@ -64,6 +66,10 @@ public class Router : IServer
         _handlers[server] = handler;
         server.MessageReceived += handler;
 
+        Action<IFeedMessage> feedHandler = feedMessage => FeedReceived?.Invoke(feedMessage);
+        _feedHandlers[server] = feedHandler;
+        server.FeedReceived += feedHandler;
+
         if (_isRunning)
             server.StartAsync().GetAwaiter().GetResult();
     }
@@ -76,6 +82,12 @@ public class Router : IServer
         {
             server.MessageReceived -= handler;
             _handlers.Remove(server);
+        }
+
+        if (_feedHandlers.TryGetValue(server, out var feedHandler))
+        {
+            server.FeedReceived -= feedHandler;
+            _feedHandlers.Remove(server);
         }
 
         _servers.Remove(server);
@@ -139,6 +151,7 @@ public class Router : IServer
 
         _servers.Clear();
         _handlers.Clear();
+        _feedHandlers.Clear();
         _routingTable.Clear();
     }
 }

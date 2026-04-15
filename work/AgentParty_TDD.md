@@ -833,7 +833,234 @@ dotnet add package AgentParty
 </configuration>
 ```
 
-## 12. Ограничения и допущения
+## 12. Feed — информационный канал
+
+### 12.1. Концепция
+
+Feed — однонаправленный поток входящей информации, который не является ни сообщением от пользователя, ни командой. Это "труба", по которой сервер проталкивает данные агенту. Агент не знает и не должен знать, откуда эти данные — из Telegram-канала, RSS, файловой системы или любого другого источника.
+
+Feed не подразумевает ответа. Агент может использовать данные из feed как контекст, триггер для действий или просто игнорировать.
+
+### 12.2. IFeedMessage
+
+```csharp
+public interface IFeedMessage
+{
+    string Content { get; }
+    string? Author { get; }
+    DateTime Timestamp { get; }
+}
+```
+
+Поля:
+- `Content` — текстовое содержимое (обязательное). Всегда строка, без JSON-обёрток.
+- `Author` — автор (необязательное). Может отсутствовать (посты каналов, автоматические уведомления).
+- `Timestamp` — время создания (UTC).
+
+Feed-сообщение **не имеет** `Id`, `Type`, `ClientId` — это не сообщение протокола, а единица информации.
+
+### 12.3. FeedMessage (реализация)
+
+```csharp
+public class FeedMessage : IFeedMessage
+{
+    public string Content { get; set; } = string.Empty;
+    public string? Author { get; set; }
+    public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+}
+```
+
+Файл: `FeedMessage.cs` в корне проекта (рядом с `Message.cs`).
+
+### 12.4. Изменения в IServer
+
+```csharp
+public interface IServer : IDisposable
+{
+    event Action<IMessage> MessageReceived;
+    event Action<IFeedMessage> FeedReceived;   // NEW
+
+    HashSet<string> AllowedCommands { get; }
+
+    Task StartAsync(CancellationToken cancellationToken = default);
+    Task StopAsync(CancellationToken cancellationToken = default);
+    Task SendAsync(string clientId, IMessage message, CancellationToken cancellationToken = default);
+}
+```
+
+Серверы, не поддерживающие feed, просто никогда не вызывают `FeedReceived`. Событие объявлено, но не используется (ConsoleServer).
+
+### 12.5. IClient — без изменений
+
+Feed — односторонний канал: клиент → сервер → агент. Клиент не получает feed, поэтому `IClient` не меняется. Клиенты, которым нужно отправлять feed-данные серверу, делают это через собственные методы конкретной реализации (например, `FileClient.SendFeedAsync`).
+
+### 12.6. Изменения в Router
+
+Router подписывается на `FeedReceived` у всех зарегистрированных серверов и агрегирует их в собственный `FeedReceived`, аналогично тому, как он уже делает с `MessageReceived`.
+
+```csharp
+public class Router : IServer
+{
+    public event Action<IMessage>? MessageReceived;
+    public event Action<IFeedMessage>? FeedReceived;   // NEW
+
+    // Register/Unregister подписываются/отписываются от FeedReceived серверов
+}
+```
+
+Feed не проходит через фильтрацию команд и не участвует в таблице маршрутизации — это чистый односторонний поток.
+
+### 12.7. TelegramServer — изменения
+
+#### Удаляем
+
+- `public event Action<Update>? RawUpdateReceived` — заменяется на `FeedReceived` из `IServer`.
+- `public long BotId { get; private set; }` — больше не нужен на публичном API. Не нужен и внутри.
+
+#### Конфигурация
+
+```csharp
+public class TelegramServerConfig
+{
+    public string BotToken { get; set; } = string.Empty;
+    public string BotName { get; set; } = string.Empty;
+    public string AttentionMarker { get; set; } = " 📌";
+    public HashSet<string> AllowedCommands { get; set; } = new();
+    public long AllowedUserId { get; set; }                      // NEW
+    public HashSet<long> FeedChatIds { get; set; } = new();      // NEW
+}
+```
+
+- `AllowedUserId` — ID пользователя Telegram, от которого принимаются обычные сообщения и команды. Сообщения от других пользователей (не из feed-чатов) — дропаются.
+- `FeedChatIds` — ID каналов и групп, сообщения из которых идут в feed. Пользователи внутри этих чатов не фильтруются — всё идёт в трубу.
+
+#### Логика HandleUpdateAsync
+
+```
+Получен update:
+  1. chatId входит в FeedChatIds?
+     → Да: собираем текст (text / caption / document.fileName), создаём FeedMessage, вызываем FeedReceived
+     → Нет: переходим к п.2
+  2. Это callback_query?
+     → Да: обрабатываем как раньше (HandleCallbackQuery → MessageReceived)
+     → Нет: переходим к п.3
+  3. Есть текст сообщения?
+     → Да: userId совпадает с AllowedUserId?
+        → Да: обрабатываем как раньше (Message → MessageReceived)
+        → Нет: дропаем
+     → Нет: дропаем
+```
+
+#### Сбор текста из feed-апдейтов
+
+Из Telegram-апдейта извлекаем текстовое содержимое в следующем приоритете:
+1. `update.ChannelPost?.Text` или `update.Message?.Text` — текст сообщения
+2. `update.ChannelPost?.Caption` или `update.Message?.Caption` — подпись к фото/видео/документу
+3. `update.ChannelPost?.Document?.FileName` или `update.Message?.Document?.FileName` — имя файла
+
+Если ничего текстового нет — апдейт из feed дропается.
+
+Author заполняется из `update.Message?.From?.Username` или `update.Message?.From?.FirstName` (если доступно). Для `ChannelPost` автор обычно отсутствует — будет `null`.
+
+### 12.8. FileServer / FileClient — feed через отдельную папку
+
+#### Структура папки
+
+```
+{Directory}/
+  incoming/    ← клиент пишет сообщения, сервер читает
+  outgoing/    ← сервер пишет сообщения, клиент читает
+  feed/        ← клиент пишет feed, сервер читает          // NEW
+```
+
+#### Конфигурация
+
+Дополнительных полей конфигурации не требуется. Папка `feed/` создаётся автоматически при старте, если сервер/клиент работает с директорией.
+
+#### FileServer
+
+При старте начинает мониторить папку `feed/` (FileSystemWatcher + polling) аналогично `incoming/`. Файлы в `feed/` — JSON-сериализованные `FeedMessage`. При чтении десериализует, удаляет файл, вызывает `FeedReceived`.
+
+#### FileClient
+
+Для отправки feed-данных серверу добавляем метод (не в интерфейс IClient — feed не является частью протокола общения клиента с сервером, но FileClient может быть утилитой для записи в feed):
+
+```csharp
+public class FileClient : IClient
+{
+    // ... существующее ...
+    
+    public Task SendFeedAsync(IFeedMessage feedMessage, CancellationToken cancellationToken = default);
+}
+```
+
+`SendFeedAsync` сериализует `FeedMessage` в JSON и пишет в папку `feed/` с атомарной записью (.tmp → .json).
+
+**Итого для File-транспорта:**
+- `FileServer` — мониторит `feed/`, десериализует `FeedMessage`, вызывает `FeedReceived`.
+- `FileClient` — имеет `SendFeedAsync` для записи в `feed/`.
+
+### 12.9. ConsoleServer / ConsoleClient
+
+Feed не поддерживается. Событие `FeedReceived` объявлено (требование интерфейса), но никогда не вызывается.
+
+### 12.10. Формат feed-файла (File-транспорт)
+
+```json
+{
+    "content": "Новая статья о GameDev: 10 паттернов для AI врагов",
+    "author": "GameDevChannel",
+    "timestamp": "2026-04-15T10:30:00Z"
+}
+```
+
+### 12.11. Пример использования
+
+```csharp
+var router = new Router();
+router.Register(telegramServer);
+router.Register(fileServer);
+
+router.MessageReceived += async message =>
+{
+    // Обычные сообщения и команды — как раньше
+};
+
+router.FeedReceived += feedMessage =>
+{
+    // Информация из каналов, файлов и т.д.
+    // Агент решает, что с ней делать
+    logger.Log($"Feed: {feedMessage.Content} (from: {feedMessage.Author ?? "unknown"})");
+    agentContext.AddFeedItem(feedMessage);
+};
+
+await router.StartAsync();
+```
+
+### 12.12. Новые файлы
+
+```
+AgentParty/
+  src/
+    AgentParty/
+      IFeedMessage.cs                    // NEW — интерфейс
+      FeedMessage.cs                     // NEW — реализация
+```
+
+### 12.13. Изменяемые файлы
+
+| Файл | Изменение |
+|------|-----------|
+| `IServer.cs` | + `event Action<IFeedMessage> FeedReceived` |
+| `IClient.cs` | + `event Action<IFeedMessage> FeedReceived` |
+| `Router.cs` | + подписка/отписка на `FeedReceived` серверов, агрегация |
+| `TelegramServer.cs` | − `RawUpdateReceived`, − `BotId`, + `FeedReceived`, + логика фильтрации по `AllowedUserId` / `FeedChatIds`, + сбор текста из feed-апдейтов |
+| `TelegramServerConfig.cs` | + `AllowedUserId`, + `FeedChatIds` |
+| `FileServer.cs` | + мониторинг `feed/`, + `FeedReceived` |
+| `FileClient.cs` | + `SendFeedAsync` |
+| `ConsoleServer.cs` | + `FeedReceived` (не используется) |
+
+## 13. Ограничения и допущения
 
 - Библиотека не управляет сессиями. Группировка сообщений в сессии, контексты, диалоги — ответственность потребляющего кода.
 - Файловый транспорт работает на доверии: клиент сам фильтрует свои сообщения, защиты от чтения чужих нет.

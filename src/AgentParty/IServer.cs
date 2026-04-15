@@ -3,6 +3,7 @@ namespace AgentParty;
 public interface IServer : IDisposable
 {
     event Action<IMessage> MessageReceived;
+    event Action<IFeedMessage> FeedReceived;
 
     HashSet<string> AllowedCommands { get; }
 

@@ -28,6 +28,7 @@ AgentParty does **not** handle orchestration, task routing, session management, 
   - [Router](#router-api)
   - [Content Models](#content-models)
 - [Lifecycle & Edge Cases](#lifecycle--edge-cases)
+- [Feed](#feed)
 - [Extending AgentParty](#extending-agentparty)
 - [Building from Source](#building-from-source)
 - [License](#license)
@@ -36,6 +37,7 @@ AgentParty does **not** handle orchestration, task routing, session management, 
 
 ## Key Features
 
+- **Feed** — one-way information channel (Telegram channels, file-based feeds) delivered as `FeedReceived` events.
 - **Typed messages** — `text`, `choice`, `list`, `notification`, `command`, `response` with structured content models.
 - **Transport rendering** — each transport renders typed messages in its native format.
 - **Router** — aggregates multiple servers behind a single event stream with automatic routing and command whitelist filtering.
@@ -69,7 +71,7 @@ dotnet add package AgentParty
 Or add to your `.csproj`:
 
 ```xml
-<PackageReference Include="AgentParty" Version="0.2.*" />
+<PackageReference Include="AgentParty" Version="0.3.*" />
 ```
 
 ### Alternative: nuget.config
@@ -356,6 +358,7 @@ File-based messaging using a shared directory. Messages are JSON envelopes — o
 {Directory}/
   incoming/    <-- client writes, server reads
   outgoing/    <-- server writes, client reads
+  feed/        <-- client writes feed, server reads
 ```
 
 #### Atomic writes
@@ -474,6 +477,7 @@ public interface IMessage
 public interface IServer : IDisposable
 {
     event Action<IMessage> MessageReceived;
+    event Action<IFeedMessage> FeedReceived;
     HashSet<string> AllowedCommands { get; }
 
     Task StartAsync(CancellationToken cancellationToken = default);
@@ -485,6 +489,7 @@ public interface IServer : IDisposable
 | Member | Description |
 |---|---|
 | `MessageReceived` | Fires when a message arrives from a client. |
+| `FeedReceived` | Fires when a feed item arrives (one-way information, no response expected). |
 | `AllowedCommands` | Whitelist of allowed commands for this server. Empty = no commands allowed. Router filters incoming `command` messages against this. |
 | `StartAsync` | Starts listening. Idempotent. |
 | `StopAsync` | Stops listening. Idempotent. |
@@ -513,6 +518,7 @@ public class Router : IServer
 
     public HashSet<string> AllowedCommands { get; }  // union of all servers
     public event Action<IMessage> MessageReceived;
+    public event Action<IFeedMessage> FeedReceived;  // aggregated from all servers
     // ... StartAsync, StopAsync, SendAsync, Dispose
 }
 ```
@@ -585,6 +591,76 @@ Unlikely (Telegram uses numeric `chatId`, file clients use GUIDs, console uses `
 
 ---
 
+## Feed
+
+Feed is a one-way information channel — data flows from external sources (Telegram channels, file-based feeds) through the server into the agent. Feed messages don't expect a response and don't participate in routing.
+
+### IFeedMessage
+
+```csharp
+public interface IFeedMessage
+{
+    string Content { get; }      // Text content (always a string, no JSON wrapping)
+    string? Author { get; }      // Optional author
+    DateTime Timestamp { get; }  // Creation time (UTC)
+}
+```
+
+Feed messages have no `Id`, `Type`, or `ClientId` — they are units of information, not protocol messages.
+
+### How it works
+
+- **Router** subscribes to `FeedReceived` on all registered servers and aggregates into its own `FeedReceived`.
+- **TelegramServer** — configure `FeedChatIds` with Telegram channel/group IDs. Messages from those chats become feed items. Configure `AllowedUserId` to accept regular messages only from a specific user.
+- **FileServer** — monitors a `feed/` subdirectory for JSON-serialized `FeedMessage` files.
+- **FileClient** — has `SendFeedAsync()` to write feed items to the `feed/` directory.
+- **ConsoleServer** — feed not supported (`FeedReceived` is declared but never fired).
+
+### TelegramServer configuration
+
+```csharp
+var server = new TelegramServer(new TelegramServerConfig
+{
+    BotToken = "123456:ABC-DEF",
+    BotName = "PM",
+    AllowedCommands = new() { "status" },
+    AllowedUserId = 123456789,           // only this user's messages are processed
+    FeedChatIds = new() { -1001234567 }  // messages from this channel go to feed
+});
+```
+
+### Usage
+
+```csharp
+router.FeedReceived += feedMessage =>
+{
+    logger.Log($"Feed: {feedMessage.Content} (from: {feedMessage.Author ?? "unknown"})");
+    agentContext.AddFeedItem(feedMessage);
+};
+```
+
+### File transport feed
+
+```csharp
+// Client writes feed
+await fileClient.SendFeedAsync(new FeedMessage
+{
+    Content = "New article about GameDev",
+    Author = "GameDevChannel"
+});
+```
+
+Directory structure with feed:
+
+```
+{Directory}/
+  incoming/    <-- client writes messages, server reads
+  outgoing/    <-- server writes messages, client reads
+  feed/        <-- client writes feed, server reads
+```
+
+---
+
 ## Extending AgentParty
 
 ### Custom Transports
@@ -621,8 +697,8 @@ AgentParty/
   AgentParty.sln
   src/
     AgentParty/
-      IMessage.cs, IServer.cs, IClient.cs
-      Message.cs, Router.cs, MessageTypes.cs
+      IMessage.cs, IServer.cs, IClient.cs, IFeedMessage.cs
+      Message.cs, FeedMessage.cs, Router.cs, MessageTypes.cs
       Content/
         ChoiceContent.cs, ListContent.cs, NotificationContent.cs
         CommandContent.cs, ResponseContent.cs

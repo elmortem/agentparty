@@ -8,6 +8,7 @@ public class RouterTests
     private class FakeServer : IServer
     {
         public event Action<IMessage>? MessageReceived;
+        public event Action<IFeedMessage>? FeedReceived;
         public List<(string ClientId, IMessage Message)> Sent { get; } = new();
         public int StartCount { get; private set; }
         public int StopCount { get; private set; }
@@ -22,6 +23,7 @@ public class RouterTests
             return Task.CompletedTask;
         }
         public void SimulateMessage(IMessage message) => MessageReceived?.Invoke(message);
+        public void SimulateFeed(IFeedMessage feedMessage) => FeedReceived?.Invoke(feedMessage);
         public void Dispose() => IsDisposed = true;
     }
 
@@ -297,5 +299,66 @@ public class RouterTests
         server.SimulateMessage(msg);
 
         Assert.NotNull(received);
+    }
+
+    // --- Feed tests ---
+
+    [Fact]
+    public void FeedReceived_IsPropagatedFromRegisteredServer()
+    {
+        var server = new FakeServer();
+        var router = new Router();
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        IFeedMessage? received = null;
+        router.FeedReceived += f => received = f;
+
+        var feed = new FeedMessage { Content = "news from channel", Author = "TestAuthor" };
+        server.SimulateFeed(feed);
+
+        Assert.NotNull(received);
+        Assert.Equal("news from channel", received.Content);
+        Assert.Equal("TestAuthor", received.Author);
+    }
+
+    [Fact]
+    public void FeedReceived_AggregatesFromMultipleServers()
+    {
+        var s1 = new FakeServer();
+        var s2 = new FakeServer();
+        var router = new Router();
+        router.Register(s1);
+        router.Register(s2);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        var feeds = new List<IFeedMessage>();
+        router.FeedReceived += f => feeds.Add(f);
+
+        s1.SimulateFeed(new FeedMessage { Content = "from s1" });
+        s2.SimulateFeed(new FeedMessage { Content = "from s2" });
+
+        Assert.Equal(2, feeds.Count);
+        Assert.Equal("from s1", feeds[0].Content);
+        Assert.Equal("from s2", feeds[1].Content);
+    }
+
+    [Fact]
+    public void Unregister_StopsFeedPropagation()
+    {
+        var server = new FakeServer();
+        var router = new Router();
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        var feeds = new List<IFeedMessage>();
+        router.FeedReceived += f => feeds.Add(f);
+
+        server.SimulateFeed(new FeedMessage { Content = "before unregister" });
+        router.Unregister(server);
+        server.SimulateFeed(new FeedMessage { Content = "after unregister" });
+
+        Assert.Single(feeds);
+        Assert.Equal("before unregister", feeds[0].Content);
     }
 }

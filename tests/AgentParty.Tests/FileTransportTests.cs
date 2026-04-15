@@ -115,4 +115,33 @@ public class FileTransportTests : IDisposable
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => server.SendAsync("c1", new Message()));
     }
+
+    [Fact]
+    public async Task ClientSendsFeed_ServerReceivesIt()
+    {
+        var serverConfig = new FileServerConfig { Directory = _tempDir, PollingIntervalMs = 100 };
+        var clientConfig = new FileClientConfig { Directory = _tempDir, ClientId = "test-client", PollingIntervalMs = 100 };
+
+        using var server = new FileServer(serverConfig);
+        using var client = new FileClient(clientConfig);
+
+        var tcs = new TaskCompletionSource<IFeedMessage>();
+        server.FeedReceived += f => tcs.TrySetResult(f);
+
+        await server.StartAsync();
+        await client.ConnectAsync();
+
+        await client.SendFeedAsync(new FeedMessage
+        {
+            Content = "news from channel",
+            Author = "TestAuthor"
+        });
+
+        var result = await Task.WhenAny(tcs.Task, Task.Delay(5000));
+        Assert.Equal(tcs.Task, result);
+
+        var received = tcs.Task.Result;
+        Assert.Equal("news from channel", received.Content);
+        Assert.Equal("TestAuthor", received.Author);
+    }
 }

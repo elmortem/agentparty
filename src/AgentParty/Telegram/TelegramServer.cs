@@ -19,6 +19,8 @@ public class TelegramServer : IServer
     private bool _disposed;
 
     public event Action<IMessage>? MessageReceived;
+    public event Action<IFeedMessage>? FeedReceived;
+
     public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
     public TelegramServer(TelegramServerConfig config, TelegramRenderer? renderer = null)
@@ -40,7 +42,14 @@ public class TelegramServer : IServer
             errorHandler: HandleErrorAsync,
             receiverOptions: new ReceiverOptions
             {
-                AllowedUpdates = [UpdateType.Message, UpdateType.CallbackQuery]
+                AllowedUpdates =
+                [
+                    UpdateType.Message,
+                    UpdateType.CallbackQuery,
+                    UpdateType.ChannelPost,
+                    UpdateType.EditedMessage,
+                    UpdateType.EditedChannelPost
+                ]
             },
             cancellationToken: _cts.Token
         );
@@ -76,27 +85,56 @@ public class TelegramServer : IServer
 
     private Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
+        // 1. Check if this is a feed chat
+        var chatId = update.ChannelPost?.Chat.Id ?? update.Message?.Chat.Id;
+        if (chatId.HasValue && _config.FeedChatIds.Contains(chatId.Value))
+        {
+            HandleFeedUpdate(update);
+            return Task.CompletedTask;
+        }
+
+        // 2. Callback query
         if (update.CallbackQuery is { } callbackQuery)
         {
             HandleCallbackQuery(callbackQuery);
             return Task.CompletedTask;
         }
 
+        // 3. Text message from allowed user
         if (update.Message?.Text is not { } text)
             return Task.CompletedTask;
 
-        var chatId = update.Message.Chat.Id;
+        if (_config.AllowedUserId != 0 && update.Message.From?.Id != _config.AllowedUserId)
+            return Task.CompletedTask;
 
         var message = new Message
         {
             Type = MessageTypes.Message,
             Content = text,
-            ClientId = chatId.ToString(),
+            ClientId = update.Message.Chat.Id.ToString(),
             Timestamp = update.Message.Date
         };
 
         MessageReceived?.Invoke(message);
         return Task.CompletedTask;
+    }
+
+    private void HandleFeedUpdate(Update update)
+    {
+        var msg = update.ChannelPost ?? update.Message;
+        if (msg == null) return;
+
+        var content = msg.Text ?? msg.Caption ?? msg.Document?.FileName;
+        if (content == null) return;
+
+        var author = msg.From?.Username ?? msg.From?.FirstName;
+
+        FeedReceived?.Invoke(new FeedMessage
+        {
+            Content = content,
+            Author = author,
+            Timestamp = msg.Date
+        });
     }
 
     private void HandleCallbackQuery(CallbackQuery callbackQuery)

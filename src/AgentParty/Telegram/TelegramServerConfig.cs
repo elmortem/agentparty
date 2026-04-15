@@ -6,4 +6,6 @@ public class TelegramServerConfig
     public string BotName { get; set; } = string.Empty;
     public string AttentionMarker { get; set; } = " \ud83d\udccc";
     public HashSet<string> AllowedCommands { get; set; } = new();
+    public long AllowedUserId { get; set; }
+    public HashSet<long> FeedChatIds { get; set; } = new();
 }

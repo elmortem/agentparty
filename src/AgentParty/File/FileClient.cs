@@ -7,6 +7,7 @@ public class FileClient : IClient
     private readonly FileClientConfig _config;
     private readonly string _incomingDir;
     private readonly string _outgoingDir;
+    private readonly string _feedDir;
     private FileSystemWatcher? _watcher;
     private CancellationTokenSource? _cts;
     private Task? _pollingTask;
@@ -20,6 +21,7 @@ public class FileClient : IClient
         _config = config;
         _incomingDir = Path.Combine(config.Directory, "incoming");
         _outgoingDir = Path.Combine(config.Directory, "outgoing");
+        _feedDir = Path.Combine(config.Directory, "feed");
     }
 
     public Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -29,6 +31,7 @@ public class FileClient : IClient
 
         System.IO.Directory.CreateDirectory(_incomingDir);
         System.IO.Directory.CreateDirectory(_outgoingDir);
+        System.IO.Directory.CreateDirectory(_feedDir);
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
@@ -91,6 +94,30 @@ public class FileClient : IClient
         var guid = Guid.NewGuid().ToString();
         var tmpPath = Path.Combine(_incomingDir, $"{guid}.tmp");
         var jsonPath = Path.Combine(_incomingDir, $"{guid}.json");
+
+        System.IO.File.WriteAllText(tmpPath, json);
+        System.IO.File.Move(tmpPath, jsonPath);
+
+        return Task.CompletedTask;
+    }
+
+    public Task SendFeedAsync(IFeedMessage feedMessage, CancellationToken cancellationToken = default)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!_isRunning)
+            throw new InvalidOperationException("FileClient is not connected.");
+
+        var envelope = new FeedMessage
+        {
+            Content = feedMessage.Content,
+            Author = feedMessage.Author,
+            Timestamp = feedMessage.Timestamp
+        };
+
+        var json = JsonSerializer.Serialize(envelope);
+        var guid = Guid.NewGuid().ToString();
+        var tmpPath = Path.Combine(_feedDir, $"{guid}.tmp");
+        var jsonPath = Path.Combine(_feedDir, $"{guid}.json");
 
         System.IO.File.WriteAllText(tmpPath, json);
         System.IO.File.Move(tmpPath, jsonPath);

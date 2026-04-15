@@ -7,13 +7,16 @@ public class FileServer : IServer
     private readonly FileServerConfig _config;
     private readonly string _incomingDir;
     private readonly string _outgoingDir;
+    private readonly string _feedDir;
     private FileSystemWatcher? _watcher;
+    private FileSystemWatcher? _feedWatcher;
     private CancellationTokenSource? _cts;
     private Task? _pollingTask;
     private bool _isRunning;
     private bool _disposed;
 
     public event Action<IMessage>? MessageReceived;
+    public event Action<IFeedMessage>? FeedReceived;
     public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
     public FileServer(FileServerConfig config)
@@ -21,6 +24,7 @@ public class FileServer : IServer
         _config = config;
         _incomingDir = Path.Combine(config.Directory, "incoming");
         _outgoingDir = Path.Combine(config.Directory, "outgoing");
+        _feedDir = Path.Combine(config.Directory, "feed");
     }
 
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -30,6 +34,7 @@ public class FileServer : IServer
 
         System.IO.Directory.CreateDirectory(_incomingDir);
         System.IO.Directory.CreateDirectory(_outgoingDir);
+        System.IO.Directory.CreateDirectory(_feedDir);
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
@@ -39,11 +44,18 @@ public class FileServer : IServer
         };
         _watcher.Created += (_, _) => ProcessIncomingFiles();
 
+        _feedWatcher = new FileSystemWatcher(_feedDir, "*.json")
+        {
+            EnableRaisingEvents = true
+        };
+        _feedWatcher.Created += (_, _) => ProcessFeedFiles();
+
         _pollingTask = Task.Run(async () =>
         {
             while (!_cts.Token.IsCancellationRequested)
             {
                 ProcessIncomingFiles();
+                ProcessFeedFiles();
                 try { await Task.Delay(_config.PollingIntervalMs, _cts.Token); }
                 catch (OperationCanceledException) { break; }
             }
@@ -62,6 +74,9 @@ public class FileServer : IServer
 
         _watcher?.Dispose();
         _watcher = null;
+
+        _feedWatcher?.Dispose();
+        _feedWatcher = null;
 
         _cts?.Cancel();
         if (_pollingTask != null)
@@ -134,6 +149,41 @@ public class FileServer : IServer
         catch (DirectoryNotFoundException)
         {
             // Directory removed externally
+        }
+    }
+
+    private void ProcessFeedFiles()
+    {
+        if (_disposed || !_isRunning) return;
+
+        try
+        {
+            var files = new DirectoryInfo(_feedDir)
+                .GetFiles("*.json")
+                .OrderBy(f => f.CreationTimeUtc)
+                .ToList();
+
+            foreach (var file in files)
+            {
+                try
+                {
+                    var json = System.IO.File.ReadAllText(file.FullName);
+                    System.IO.File.Delete(file.FullName);
+
+                    var feedMessage = JsonSerializer.Deserialize<FeedMessage>(json);
+                    if (feedMessage != null)
+                        FeedReceived?.Invoke(feedMessage);
+                }
+                catch (IOException)
+                {
+                }
+                catch (JsonException)
+                {
+                }
+            }
+        }
+        catch (DirectoryNotFoundException)
+        {
         }
     }
 

@@ -16,6 +16,7 @@ public class ConsoleServer : IServer
     private bool _startupCommandsSent;
 
     public event Action<IMessage>? MessageReceived;
+    public event Action<IFeedMessage>? FeedReceived;
     public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
     public ConsoleServer(ConsoleServerConfig config, ConsoleRenderer? renderer = null,
