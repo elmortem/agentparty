@@ -12,6 +12,7 @@ public class TelegramServer : IServer
 {
     private readonly TelegramServerConfig _config;
     private readonly TelegramRenderer _renderer;
+    private readonly IRawLogger? _rawLogger;
     private readonly ConcurrentDictionary<int, string> _sentMessageMap = new(); // telegramMsgId → agentPartyMsgId
     private TelegramBotClient? _botClient;
     private CancellationTokenSource? _cts;
@@ -23,10 +24,11 @@ public class TelegramServer : IServer
 
     public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
-    public TelegramServer(TelegramServerConfig config, TelegramRenderer? renderer = null)
+    public TelegramServer(TelegramServerConfig config, TelegramRenderer? renderer = null, IRawLogger? rawLogger = null)
     {
         _config = config;
         _renderer = renderer ?? new TelegramRenderer(config);
+        _rawLogger = rawLogger;
     }
 
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -85,6 +87,8 @@ public class TelegramServer : IServer
 
     private Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
+        _rawLogger?.Log("TelegramServer.Update", JsonSerializer.Serialize(update));
+
         // 1. Callback query
         if (update.CallbackQuery is { } callbackQuery)
         {

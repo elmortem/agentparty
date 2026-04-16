@@ -5,6 +5,7 @@ namespace AgentParty.File;
 public class FileServer : IServer
 {
     private readonly FileServerConfig _config;
+    private readonly IRawLogger? _rawLogger;
     private readonly string _incomingDir;
     private readonly string _outgoingDir;
     private readonly string _feedDir;
@@ -19,9 +20,10 @@ public class FileServer : IServer
     public event Action<IFeedMessage>? FeedReceived;
     public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
-    public FileServer(FileServerConfig config)
+    public FileServer(FileServerConfig config, IRawLogger? rawLogger = null)
     {
         _config = config;
+        _rawLogger = rawLogger;
         _incomingDir = Path.Combine(config.Directory, "incoming");
         _outgoingDir = Path.Combine(config.Directory, "outgoing");
         _feedDir = Path.Combine(config.Directory, "feed");
@@ -132,6 +134,8 @@ public class FileServer : IServer
                     var json = System.IO.File.ReadAllText(file.FullName);
                     System.IO.File.Delete(file.FullName);
 
+                    _rawLogger?.Log("FileServer.Incoming", json);
+
                     var message = JsonSerializer.Deserialize<Message>(json);
                     if (message != null)
                         MessageReceived?.Invoke(message);
@@ -168,6 +172,8 @@ public class FileServer : IServer
                 try
                 {
                     var json = System.IO.File.ReadAllText(file.FullName);
+
+                    _rawLogger?.Log("FileServer.Feed", json);
 
                     var feedMessage = JsonSerializer.Deserialize<FeedMessage>(json);
                     if (feedMessage != null)

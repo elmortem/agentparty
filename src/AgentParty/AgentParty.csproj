@@ -10,6 +10,7 @@
     <Description>Transport and rendering abstraction for LLM agent communication</Description>
     <RepositoryUrl>https://github.com/elmortem/AgentParty</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <Version>0.6</Version>
   </PropertyGroup>
 
   <ItemGroup>

@@ -7,6 +7,7 @@ public class ConsoleServer : IServer
 {
     private readonly ConsoleServerConfig _config;
     private readonly ConsoleRenderer _renderer;
+    private readonly IRawLogger? _rawLogger;
     private readonly TextReader _input;
     private readonly TextWriter _output;
     private CancellationTokenSource? _cts;
@@ -20,10 +21,11 @@ public class ConsoleServer : IServer
     public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
     public ConsoleServer(ConsoleServerConfig config, ConsoleRenderer? renderer = null,
-        TextReader? input = null, TextWriter? output = null)
+        TextReader? input = null, TextWriter? output = null, IRawLogger? rawLogger = null)
     {
         _config = config;
         _renderer = renderer ?? new ConsoleRenderer();
+        _rawLogger = rawLogger;
         _input = input ?? System.Console.In;
         _output = output ?? System.Console.Out;
     }
@@ -92,6 +94,8 @@ public class ConsoleServer : IServer
                 if (line == null) break; // EOF
 
                 if (string.IsNullOrWhiteSpace(line)) continue;
+
+                _rawLogger?.Log("ConsoleServer.Input", line);
 
                 IMessage message;
                 if (line.StartsWith('/'))
