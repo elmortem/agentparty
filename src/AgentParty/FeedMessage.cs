@@ -12,4 +12,7 @@ public class FeedMessage : IFeedMessage
 
     [JsonPropertyName("timestamp")]
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+
+    [JsonPropertyName("source")]
+    public string Source { get; set; } = string.Empty;
 }

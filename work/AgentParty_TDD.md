@@ -743,7 +743,7 @@ Router отслеживает своё состояние (`_isRunning`). Пов
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <PackageId>AgentParty</PackageId>
-    <VersionPrefix>0.2</VersionPrefix>
+    <VersionPrefix>0.4</VersionPrefix>
     <Authors>elmortem</Authors>
     <Description>Transport and rendering abstraction for LLM agent communication</Description>
     <RepositoryUrl>https://github.com/elmortem/AgentParty</RepositoryUrl>
@@ -849,6 +849,7 @@ public interface IFeedMessage
     string Content { get; }
     string? Author { get; }
     DateTime Timestamp { get; }
+    string Source { get; }
 }
 ```
 
@@ -856,6 +857,7 @@ public interface IFeedMessage
 - `Content` — текстовое содержимое (обязательное). Всегда строка, без JSON-обёрток.
 - `Author` — автор (необязательное). Может отсутствовать (посты каналов, автоматические уведомления).
 - `Timestamp` — время создания (UTC).
+- `Source` — строковый идентификатор источника (обязательное). Задаётся транспортным уровнем: TelegramServer — `chatId.ToString()`, FileServer — из JSON. Пустая строка допустима. Библиотека не валидирует и не интерпретирует значение; семантика определяется потребителем.
 
 Feed-сообщение **не имеет** `Id`, `Type`, `ClientId` — это не сообщение протокола, а единица информации.
 
@@ -867,6 +869,7 @@ public class FeedMessage : IFeedMessage
     public string Content { get; set; } = string.Empty;
     public string? Author { get; set; }
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+    public string Source { get; set; } = string.Empty;
 }
 ```
 
@@ -1010,9 +1013,12 @@ Feed не поддерживается. Событие `FeedReceived` объяв
 {
     "content": "Новая статья о GameDev: 10 паттернов для AI врагов",
     "author": "GameDevChannel",
+    "source": "dev-feed",
     "timestamp": "2026-04-15T10:30:00Z"
 }
 ```
+
+Если `source` не указан в JSON — десериализуется как пустая строка (default).
 
 ### 12.11. Пример использования
 
@@ -1030,7 +1036,7 @@ router.FeedReceived += feedMessage =>
 {
     // Информация из каналов, файлов и т.д.
     // Агент решает, что с ней делать
-    logger.Log($"Feed: {feedMessage.Content} (from: {feedMessage.Author ?? "unknown"})");
+    logger.Log($"Feed [{feedMessage.Source}]: {feedMessage.Content} (from: {feedMessage.Author ?? "unknown"})");
     agentContext.AddFeedItem(feedMessage);
 };
 

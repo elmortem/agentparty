@@ -133,7 +133,8 @@ public class TelegramServer : IServer
         {
             Content = content,
             Author = author,
-            Timestamp = msg.Date
+            Timestamp = msg.Date,
+            Source = msg.Chat.Id.ToString()
         });
     }
 

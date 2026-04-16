@@ -71,7 +71,7 @@ dotnet add package AgentParty
 Or add to your `.csproj`:
 
 ```xml
-<PackageReference Include="AgentParty" Version="0.3.*" />
+<PackageReference Include="AgentParty" Version="0.4.*" />
 ```
 
 ### Alternative: nuget.config
@@ -603,10 +603,11 @@ public interface IFeedMessage
     string Content { get; }      // Text content (always a string, no JSON wrapping)
     string? Author { get; }      // Optional author
     DateTime Timestamp { get; }  // Creation time (UTC)
+    string Source { get; }       // Source identifier (e.g. Telegram chatId, file-based tag)
 }
 ```
 
-Feed messages have no `Id`, `Type`, or `ClientId` — they are units of information, not protocol messages.
+Feed messages have no `Id`, `Type`, or `ClientId` — they are units of information, not protocol messages. `Source` is a transport-level identifier: TelegramServer sets it to `chatId.ToString()`, FileServer deserializes it from JSON. The library does not validate or interpret the value — semantics are defined by the consumer.
 
 ### How it works
 
@@ -634,7 +635,7 @@ var server = new TelegramServer(new TelegramServerConfig
 ```csharp
 router.FeedReceived += feedMessage =>
 {
-    logger.Log($"Feed: {feedMessage.Content} (from: {feedMessage.Author ?? "unknown"})");
+    logger.Log($"Feed [{feedMessage.Source}]: {feedMessage.Content} (from: {feedMessage.Author ?? "unknown"})");
     agentContext.AddFeedItem(feedMessage);
 };
 ```
@@ -646,7 +647,8 @@ router.FeedReceived += feedMessage =>
 await fileClient.SendFeedAsync(new FeedMessage
 {
     Content = "New article about GameDev",
-    Author = "GameDevChannel"
+    Author = "GameDevChannel",
+    Source = "dev-feed"
 });
 ```
 
