@@ -96,41 +96,44 @@ public class TelegramServer : IServer
             return Task.CompletedTask;
         }
 
-        // 2. Message from allowed user
-        var userId = update.Message?.From?.Id;
-        if (userId.HasValue && _config.AllowedUserIds.Count > 0 && _config.AllowedUserIds.Contains(userId.Value))
+        // 2. Determine message
+        var msg = update.ChannelPost ?? update.Message;
+        if (msg == null) return Task.CompletedTask;
+
+        // 3. Route by chat type
+        if (msg.Chat.Type == ChatType.Private)
         {
-            if (update.Message?.Text is { } text)
+            // Private chat → AllowedUserIds → MessageReceived
+            var userId = msg.From?.Id;
+            if (_config.AllowedUserIds.Count > 0 && (!userId.HasValue || !_config.AllowedUserIds.Contains(userId.Value)))
+                return Task.CompletedTask;
+
+            if (msg.Text is { } text)
             {
                 var message = new Message
                 {
                     Type = MessageTypes.Message,
                     Content = text,
-                    ClientId = update.Message.Chat.Id.ToString(),
-                    Timestamp = update.Message.Date
+                    ClientId = msg.Chat.Id.ToString(),
+                    Timestamp = msg.Date
                 };
                 MessageReceived?.Invoke(message);
             }
             return Task.CompletedTask;
         }
 
-        // 3. Feed: FeedDiscoveryMode or chatId in FeedChatIds
-        var chatId = update.ChannelPost?.Chat.Id ?? update.Message?.Chat.Id;
-        if (_config.FeedDiscoveryMode || (chatId.HasValue && _config.FeedChatIds.Contains(chatId.Value)))
+        // 4. Non-private chat → FeedSources / FeedDiscoveryMode → FeedReceived
+        var feedSource = new FeedSource(msg.Chat.Id, msg.MessageThreadId);
+        if (_config.FeedDiscoveryMode || _config.FeedSources.Contains(feedSource))
         {
-            HandleFeedUpdate(update);
-            return Task.CompletedTask;
+            HandleFeedUpdate(msg, feedSource);
         }
 
-        // 4. Drop
         return Task.CompletedTask;
     }
 
-    private void HandleFeedUpdate(Update update)
+    private void HandleFeedUpdate(global::Telegram.Bot.Types.Message msg, FeedSource feedSource)
     {
-        var msg = update.ChannelPost ?? update.Message;
-        if (msg == null) return;
-
         var content = msg.Text ?? msg.Caption ?? msg.Document?.FileName;
         if (content == null) return;
 
@@ -141,7 +144,7 @@ public class TelegramServer : IServer
             Content = content,
             Author = author,
             Timestamp = msg.Date,
-            Source = msg.Chat.Id.ToString()
+            Source = feedSource.ToString()
         });
     }
 

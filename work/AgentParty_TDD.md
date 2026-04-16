@@ -857,7 +857,7 @@ public interface IFeedMessage
 - `Content` — текстовое содержимое (обязательное). Всегда строка, без JSON-обёрток.
 - `Author` — автор (необязательное). Может отсутствовать (посты каналов, автоматические уведомления).
 - `Timestamp` — время создания (UTC).
-- `Source` — строковый идентификатор источника (обязательное). Задаётся транспортным уровнем: TelegramServer — `chatId.ToString()`, FileServer — из JSON. Пустая строка допустима. Библиотека не валидирует и не интерпретирует значение; семантика определяется потребителем.
+- `Source` — строковый идентификатор источника (обязательное). Задаётся транспортным уровнем: TelegramServer — `FeedSource.ToString()` (формат `"chatId"` или `"chatId/threadId"`), FileServer — из JSON. Пустая строка допустима. Библиотека не валидирует и не интерпретирует значение; семантика определяется потребителем.
 
 Feed-сообщение **не имеет** `Id`, `Type`, `ClientId` — это не сообщение протокола, а единица информации.
 
@@ -920,6 +920,24 @@ Feed не проходит через фильтрацию команд и не 
 - `public event Action<Update>? RawUpdateReceived` — заменяется на `FeedReceived` из `IServer`.
 - `public long BotId { get; private set; }` — больше не нужен на публичном API. Не нужен и внутри.
 
+#### FeedSource — идентификатор фид-источника
+
+```csharp
+public readonly struct FeedSource : IEquatable<FeedSource>
+{
+    public long ChatId { get; }
+    public int? ThreadId { get; }
+}
+```
+
+`FeedSource` идентифицирует конкретный источник фида в Telegram: чат + опциональный топик (thread). Матчинг **строгий** — `(chatId, null)` не совпадает с `(chatId, 2736)`.
+
+Строковый формат (для конфигурации в агенте):
+- `"-1003287187081"` → `FeedSource(chatId: -1003287187081, threadId: null)` — General-тред или чат без топиков
+- `"-1003287187081/2736"` → `FeedSource(chatId: -1003287187081, threadId: 2736)` — конкретный топик
+
+`FeedSource` реализует `IEquatable<FeedSource>`, переопределяет `GetHashCode`/`Equals` для корректной работы в `HashSet`. Имеет статический метод `Parse(string)` и `ToString()` в формате выше.
+
 #### Конфигурация
 
 ```csharp
@@ -929,32 +947,48 @@ public class TelegramServerConfig
     public string BotName { get; set; } = string.Empty;
     public string AttentionMarker { get; set; } = " 📌";
     public HashSet<string> AllowedCommands { get; set; } = new();
-    public HashSet<long> AllowedUserIds { get; set; } = new();    // CHANGED: was long AllowedUserId
-    public HashSet<long> FeedChatIds { get; set; } = new();      // NEW
-    public bool FeedDiscoveryMode { get; set; }                   // NEW
+    public HashSet<long> AllowedUserIds { get; set; } = new();
+    public HashSet<FeedSource> FeedSources { get; set; } = new();   // CHANGED: was HashSet<long> FeedChatIds
+    public bool FeedDiscoveryMode { get; set; }
 }
 ```
 
-- `AllowedUserIds` — множество ID пользователей Telegram, от которых принимаются обычные сообщения и команды. Если пусто — фильтрация по пользователю отключена (принимаются все). Сообщения от других пользователей (не из feed-чатов) — дропаются.
-- `FeedChatIds` — ID каналов и групп, сообщения из которых идут в feed. Пользователи внутри этих чатов не фильтруются — всё идёт в трубу.
-- `FeedDiscoveryMode` — временный режим: если `true`, все входящие сообщения, не прошедшие фильтр `AllowedUserIds`, отправляются в feed (без проверки `FeedChatIds`). Позволяет узнать chat id групп/каналов, после чего режим отключается. Управляется из кода агента.
+- `AllowedUserIds` — множество ID пользователей Telegram, от которых принимаются сообщения и команды **из личных чатов** (`Chat.Type == "private"`). Если пусто — фильтрация по пользователю отключена (принимаются все из личных чатов). Сообщения из групп/каналов **никогда** не попадают в `MessageReceived`, независимо от `AllowedUserIds`.
+- `FeedSources` — множество `(chatId, threadId?)`, определяющее из каких чатов/топиков принимать фид. Матчинг строгий: `message_thread_id` из update должен точно совпадать с `ThreadId` в `FeedSource` (включая `null == null`).
+- `FeedDiscoveryMode` — временный режим: если `true`, **все** сообщения из не-private чатов отправляются в feed без проверки `FeedSources`. Позволяет узнать chatId/threadId групп и каналов. На личные чаты **не влияет** — они всегда идут через `AllowedUserIds` → `MessageReceived`.
 
 #### Логика HandleUpdateAsync
+
+Ключевой принцип: **тип чата определяет ветку маршрутизации**. Личные сообщения (`Chat.Type == "private"`) идут только в `MessageReceived`. Всё остальное (supergroup, group, channel) идёт только в `FeedReceived`.
 
 ```
 Получен update:
   1. Это callback_query?
-     → Да: обрабатываем как раньше (HandleCallbackQuery → MessageReceived)
+     → Да: HandleCallbackQuery → MessageReceived
      → Нет: переходим к п.2
-  2. userId входит в AllowedUserIds (и AllowedUserIds не пуст)?
-     → Да: есть текст сообщения?
-        → Да: обрабатываем как раньше (Message → MessageReceived)
+
+  2. Определяем msg = update.ChannelPost ?? update.Message
+     → msg == null: дропаем
+
+  3. Определяем тип чата: msg.Chat.Type
+
+  4. Chat.Type == "private"?
+     → Да: это личное сообщение
+        → userId входит в AllowedUserIds (или AllowedUserIds пуст)?
+           → Да + есть текст: Message → MessageReceived
+           → Нет: дропаем
+     → Нет: переходим к п.5
+
+  5. Не-private чат (supergroup, group, channel) — только фид
+     → Собираем feedSource = FeedSource(msg.Chat.Id, msg.MessageThreadId)
+     → FeedDiscoveryMode == true?
+        → Да: HandleFeedUpdate → FeedReceived
+     → feedSource входит в FeedSources? (строгий матчинг chatId + threadId, включая null == null)
+        → Да: HandleFeedUpdate → FeedReceived
         → Нет: дропаем
-     → Нет: переходим к п.3
-  3. chatId входит в FeedChatIds ИЛИ FeedDiscoveryMode == true?
-     → Да: собираем текст (text / caption / document.fileName), создаём FeedMessage, вызываем FeedReceived
-     → Нет: дропаем
 ```
+
+Важно: `msg.MessageThreadId` в Telegram API — это `int?`. Для сообщений вне топика или в General-треде оно `null`. Для сообщений в конкретном топике — числовой ID первого сообщения топика.
 
 #### Сбор текста из feed-апдейтов
 
@@ -965,7 +999,13 @@ public class TelegramServerConfig
 
 Если ничего текстового нет — апдейт из feed дропается.
 
-Author заполняется из `update.Message?.From?.Username` или `update.Message?.From?.FirstName` (если доступно). Для `ChannelPost` автор обычно отсутствует — будет `null`.
+Author заполняется из `msg.From?.Username` или `msg.From?.FirstName` (если доступно). Для `ChannelPost` автор обычно отсутствует — будет `null`.
+
+Source заполняется в формате `FeedSource.ToString()`:
+- `"-1003287187081"` — если `msg.MessageThreadId == null`
+- `"-1003287187081/2736"` — если `msg.MessageThreadId == 2736`
+
+Это позволяет агенту точно знать, из какого чата и топика пришло сообщение.
 
 ### 12.8. FileServer / FileClient — feed через отдельную папку
 
@@ -1053,6 +1093,8 @@ AgentParty/
     AgentParty/
       IFeedMessage.cs                    // NEW — интерфейс
       FeedMessage.cs                     // NEW — реализация
+      Telegram/
+        FeedSource.cs                    // NEW — readonly struct (chatId + threadId?)
 ```
 
 ### 12.13. Изменяемые файлы
@@ -1062,11 +1104,17 @@ AgentParty/
 | `IServer.cs` | + `event Action<IFeedMessage> FeedReceived` |
 | `IClient.cs` | + `event Action<IFeedMessage> FeedReceived` |
 | `Router.cs` | + подписка/отписка на `FeedReceived` серверов, агрегация |
-| `TelegramServer.cs` | − `RawUpdateReceived`, − `BotId`, + `FeedReceived`, + логика фильтрации по `AllowedUserIds` / `FeedChatIds` / `FeedDiscoveryMode`, + сбор текста из feed-апдейтов |
-| `TelegramServerConfig.cs` | + `AllowedUserIds` (HashSet<long>), + `FeedChatIds`, + `FeedDiscoveryMode` |
+| `TelegramServer.cs` | − `RawUpdateReceived`, − `BotId`, + `FeedReceived`, + маршрутизация по `Chat.Type` (private → MessageReceived, остальное → FeedReceived), + фильтрация по `FeedSources` с учётом `MessageThreadId`, + `FeedDiscoveryMode` только для не-private чатов |
+| `TelegramServerConfig.cs` | + `AllowedUserIds` (HashSet<long>), + `FeedSources` (HashSet<FeedSource>), + `FeedDiscoveryMode` |
 | `FileServer.cs` | + мониторинг `feed/`, + `FeedReceived` |
 | `FileClient.cs` | + `SendFeedAsync` |
 | `ConsoleServer.cs` | + `FeedReceived` (не используется) |
+
+### 12.14. Новые файлы
+
+| Файл | Описание |
+|------|----------|
+| `Telegram/FeedSource.cs` | `readonly struct FeedSource` — идентификатор фид-источника (chatId + threadId?), `IEquatable`, `Parse`/`ToString` |
 
 ## 13. Ограничения и допущения
 
