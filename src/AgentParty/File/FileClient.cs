@@ -111,7 +111,8 @@ public class FileClient : IClient
         {
             Content = feedMessage.Content,
             Author = feedMessage.Author,
-            Timestamp = feedMessage.Timestamp
+            Timestamp = feedMessage.Timestamp,
+            Source = feedMessage.Source
         };
 
         var json = JsonSerializer.Serialize(envelope);
