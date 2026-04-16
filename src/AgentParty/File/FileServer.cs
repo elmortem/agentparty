@@ -168,17 +168,20 @@ public class FileServer : IServer
                 try
                 {
                     var json = System.IO.File.ReadAllText(file.FullName);
-                    System.IO.File.Delete(file.FullName);
 
                     var feedMessage = JsonSerializer.Deserialize<FeedMessage>(json);
                     if (feedMessage != null)
+                    {
+                        System.IO.File.Delete(file.FullName);
                         FeedReceived?.Invoke(feedMessage);
+                    }
                 }
                 catch (IOException)
                 {
                 }
                 catch (JsonException)
                 {
+                    System.Console.Error.WriteLine($"[FileServer] Bad feed file: {file.Name}");
                 }
             }
         }

@@ -11,6 +11,7 @@ public class FeedMessage : IFeedMessage
     public string? Author { get; set; }
 
     [JsonPropertyName("timestamp")]
+    [JsonConverter(typeof(UnixDateTimeConverter))]
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
 
     [JsonPropertyName("source")]
