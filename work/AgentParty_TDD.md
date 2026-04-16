@@ -929,28 +929,30 @@ public class TelegramServerConfig
     public string BotName { get; set; } = string.Empty;
     public string AttentionMarker { get; set; } = " 📌";
     public HashSet<string> AllowedCommands { get; set; } = new();
-    public long AllowedUserId { get; set; }                      // NEW
+    public HashSet<long> AllowedUserIds { get; set; } = new();    // CHANGED: was long AllowedUserId
     public HashSet<long> FeedChatIds { get; set; } = new();      // NEW
+    public bool FeedDiscoveryMode { get; set; }                   // NEW
 }
 ```
 
-- `AllowedUserId` — ID пользователя Telegram, от которого принимаются обычные сообщения и команды. Сообщения от других пользователей (не из feed-чатов) — дропаются.
+- `AllowedUserIds` — множество ID пользователей Telegram, от которых принимаются обычные сообщения и команды. Если пусто — фильтрация по пользователю отключена (принимаются все). Сообщения от других пользователей (не из feed-чатов) — дропаются.
 - `FeedChatIds` — ID каналов и групп, сообщения из которых идут в feed. Пользователи внутри этих чатов не фильтруются — всё идёт в трубу.
+- `FeedDiscoveryMode` — временный режим: если `true`, все входящие сообщения, не прошедшие фильтр `AllowedUserIds`, отправляются в feed (без проверки `FeedChatIds`). Позволяет узнать chat id групп/каналов, после чего режим отключается. Управляется из кода агента.
 
 #### Логика HandleUpdateAsync
 
 ```
 Получен update:
-  1. chatId входит в FeedChatIds?
-     → Да: собираем текст (text / caption / document.fileName), создаём FeedMessage, вызываем FeedReceived
-     → Нет: переходим к п.2
-  2. Это callback_query?
+  1. Это callback_query?
      → Да: обрабатываем как раньше (HandleCallbackQuery → MessageReceived)
-     → Нет: переходим к п.3
-  3. Есть текст сообщения?
-     → Да: userId совпадает с AllowedUserId?
+     → Нет: переходим к п.2
+  2. userId входит в AllowedUserIds (и AllowedUserIds не пуст)?
+     → Да: есть текст сообщения?
         → Да: обрабатываем как раньше (Message → MessageReceived)
         → Нет: дропаем
+     → Нет: переходим к п.3
+  3. chatId входит в FeedChatIds ИЛИ FeedDiscoveryMode == true?
+     → Да: собираем текст (text / caption / document.fileName), создаём FeedMessage, вызываем FeedReceived
      → Нет: дропаем
 ```
 
@@ -1060,8 +1062,8 @@ AgentParty/
 | `IServer.cs` | + `event Action<IFeedMessage> FeedReceived` |
 | `IClient.cs` | + `event Action<IFeedMessage> FeedReceived` |
 | `Router.cs` | + подписка/отписка на `FeedReceived` серверов, агрегация |
-| `TelegramServer.cs` | − `RawUpdateReceived`, − `BotId`, + `FeedReceived`, + логика фильтрации по `AllowedUserId` / `FeedChatIds`, + сбор текста из feed-апдейтов |
-| `TelegramServerConfig.cs` | + `AllowedUserId`, + `FeedChatIds` |
+| `TelegramServer.cs` | − `RawUpdateReceived`, − `BotId`, + `FeedReceived`, + логика фильтрации по `AllowedUserIds` / `FeedChatIds` / `FeedDiscoveryMode`, + сбор текста из feed-апдейтов |
+| `TelegramServerConfig.cs` | + `AllowedUserIds` (HashSet<long>), + `FeedChatIds`, + `FeedDiscoveryMode` |
 | `FileServer.cs` | + мониторинг `feed/`, + `FeedReceived` |
 | `FileClient.cs` | + `SendFeedAsync` |
 | `ConsoleServer.cs` | + `FeedReceived` (не используется) |

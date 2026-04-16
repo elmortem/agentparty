@@ -85,37 +85,40 @@ public class TelegramServer : IServer
 
     private Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
-        // 1. Check if this is a feed chat
-        var chatId = update.ChannelPost?.Chat.Id ?? update.Message?.Chat.Id;
-        if (chatId.HasValue && _config.FeedChatIds.Contains(chatId.Value))
-        {
-            HandleFeedUpdate(update);
-            return Task.CompletedTask;
-        }
-
-        // 2. Callback query
+        // 1. Callback query
         if (update.CallbackQuery is { } callbackQuery)
         {
             HandleCallbackQuery(callbackQuery);
             return Task.CompletedTask;
         }
 
-        // 3. Text message from allowed user
-        if (update.Message?.Text is not { } text)
-            return Task.CompletedTask;
-
-        if (_config.AllowedUserId != 0 && update.Message.From?.Id != _config.AllowedUserId)
-            return Task.CompletedTask;
-
-        var message = new Message
+        // 2. Message from allowed user
+        var userId = update.Message?.From?.Id;
+        if (userId.HasValue && _config.AllowedUserIds.Count > 0 && _config.AllowedUserIds.Contains(userId.Value))
         {
-            Type = MessageTypes.Message,
-            Content = text,
-            ClientId = update.Message.Chat.Id.ToString(),
-            Timestamp = update.Message.Date
-        };
+            if (update.Message?.Text is { } text)
+            {
+                var message = new Message
+                {
+                    Type = MessageTypes.Message,
+                    Content = text,
+                    ClientId = update.Message.Chat.Id.ToString(),
+                    Timestamp = update.Message.Date
+                };
+                MessageReceived?.Invoke(message);
+            }
+            return Task.CompletedTask;
+        }
 
-        MessageReceived?.Invoke(message);
+        // 3. Feed: FeedDiscoveryMode or chatId in FeedChatIds
+        var chatId = update.ChannelPost?.Chat.Id ?? update.Message?.Chat.Id;
+        if (_config.FeedDiscoveryMode || (chatId.HasValue && _config.FeedChatIds.Contains(chatId.Value)))
+        {
+            HandleFeedUpdate(update);
+            return Task.CompletedTask;
+        }
+
+        // 4. Drop
         return Task.CompletedTask;
     }
 
