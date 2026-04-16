@@ -612,7 +612,7 @@ Feed messages have no `Id`, `Type`, or `ClientId` — they are units of informat
 ### How it works
 
 - **Router** subscribes to `FeedReceived` on all registered servers and aggregates into its own `FeedReceived`.
-- **TelegramServer** — configure `FeedChatIds` with Telegram channel/group IDs. Messages from those chats become feed items. Configure `AllowedUserId` to accept regular messages only from a specific user.
+- **TelegramServer** — configure `FeedChatIds` with Telegram channel/group IDs. Messages from those chats become feed items. Configure `AllowedUserIds` to accept regular messages only from specific users.
 - **FileServer** — monitors a `feed/` subdirectory for JSON-serialized `FeedMessage` files.
 - **FileClient** — has `SendFeedAsync()` to write feed items to the `feed/` directory.
 - **ConsoleServer** — feed not supported (`FeedReceived` is declared but never fired).
@@ -625,7 +625,7 @@ var server = new TelegramServer(new TelegramServerConfig
     BotToken = "123456:ABC-DEF",
     BotName = "PM",
     AllowedCommands = new() { "status" },
-    AllowedUserId = 123456789,           // only this user's messages are processed
+    AllowedUserIds = new() { 123456789 }, // only these users' messages are processed
     FeedChatIds = new() { -1001234567 }  // messages from this channel go to feed
 });
 ```
