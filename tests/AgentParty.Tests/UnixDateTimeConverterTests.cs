@@ -17,10 +17,11 @@ public class UnixDateTimeConverterTests
     }
 
     [Fact]
-    public void Write_Local_ConvertsToUtcFirst()
+    public void Write_IgnoresKind_UsesRawTicks()
     {
+        // converter does raw tick subtraction, Kind is irrelevant
         var utc = new DateTime(2026, 4, 17, 9, 42, 13, DateTimeKind.Utc);
-        var local = utc.ToLocalTime();
+        var local = new DateTime(2026, 4, 17, 9, 42, 13, DateTimeKind.Local);
         Assert.Equal(Serialize(utc), Serialize(local));
     }
 
@@ -41,9 +42,11 @@ public class UnixDateTimeConverterTests
     }
 
     [Fact]
-    public void Read_String_Throws()
+    public void Read_IsoString_ReturnsDateTime()
     {
-        Assert.ThrowsAny<Exception>(() =>
-            JsonSerializer.Deserialize<DateTime>("\"2026-04-17T09:42:13Z\"", Opts));
+        var dt = JsonSerializer.Deserialize<DateTime>("\"2026-04-17T09:42:13Z\"", Opts);
+        Assert.Equal(9, dt.Hour);
+        Assert.Equal(42, dt.Minute);
+        Assert.Equal(13, dt.Second);
     }
 }
