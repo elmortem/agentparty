@@ -5,16 +5,21 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>AgentParty</PackageId>
-    <VersionPrefix>0.7</VersionPrefix>
+    <VersionPrefix>0.8</VersionPrefix>
     <Authors>elmortem</Authors>
     <Description>Transport and rendering abstraction for LLM agent communication</Description>
     <RepositoryUrl>https://github.com/elmortem/AgentParty</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <Version>0.7</Version>
+    <Version>0.8</Version>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Telegram.Bot" Version="22.*" />
+    <PackageReference Include="System.Threading.RateLimiting" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="AgentParty.Tests" />
   </ItemGroup>
 
 </Project>

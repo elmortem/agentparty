@@ -356,16 +356,21 @@ File-based messaging using a shared directory. Messages are JSON envelopes — o
 
 ```
 {Directory}/
-  incoming/    <-- client writes, server reads
-  outgoing/    <-- server writes, client reads
-  feed/        <-- client writes feed, server reads
+  incoming/              <-- client writes, server reads
+  outgoing/
+    {clientId}/          <-- server writes per-client; client reads own subdirectory only
+  feed/                  <-- client writes feed, server reads
 ```
+
+One `FileServer` per directory. Multiple servers sharing a directory are not supported.
 
 #### Atomic writes
 
 Files are written via a temp file rename pattern:
 1. Write content to `{guid}.tmp`
 2. Rename to `{guid}.json`
+
+Stale `.tmp` files from previous crashes are cleaned up on `StartAsync` (server) and `ConnectAsync` (client).
 
 #### Configuration
 
@@ -397,25 +402,44 @@ var server = new TelegramServer(new TelegramServerConfig
     BotToken = "123456:ABC-DEF",
     BotName = "PM",
     AttentionMarker = " 📌",
-    AllowedCommands = new() { "status", "help" }
+    AllowedCommands = new() { "status", "help" },
+    SentMessagesPerClientMaxSize = 100,    // max remembered inline-button mappings per chat (FIFO, default: 100)
+    RateLimit = new TelegramRateLimitOptions
+    {
+        GlobalPerSecond = 30,   // Telegram global limit
+        PerChatPerSecond = 1,   // Telegram per-chat private limit
+        MaxRetries = 3          // retries on 429 / transient network errors
+    }
 });
 ```
 
 #### Rendering
 
+All outgoing messages use `ParseMode.Markdown` (legacy). Special chars `* _ [ \` \` in literal text must be escaped with `\`; use the `TelegramMarkdown.Escape(string)` helper when inserting user-provided content into a message.
+
 | Type | Telegram rendering |
 |------|-------------------|
-| `text` | Markdown via `SendMessage` |
-| `choice` | Text + `InlineKeyboardMarkup` |
-| `list` (info) | Formatted text with bullet points |
-| `list` (actions) | Each action item as a separate message with inline buttons |
+| `text` | `ParseMode.Markdown` via `SendMessage` |
+| `choice` | Text + `InlineKeyboardMarkup`, `ParseMode.Markdown` |
+| `list` (info) | Formatted text with bullet points, `ParseMode.Markdown`; title rendered as `*Title*` |
+| `list` (actions) | Each action item as a separate message with inline buttons, `ParseMode.Markdown` |
 | `notification` (thinking) | `SendChatAction(Typing)` |
 | `notification` (attention) | `SetMyName(BotName + AttentionMarker)` |
 | `notification` (attention_clear) | `SetMyName(BotName)` |
 
+#### Rate limiting and retry
+
+`TelegramServer` enforces per-chat (1 msg/s) and global (30 msg/s) rate limits automatically using `System.Threading.RateLimiting.TokenBucketRateLimiter`. HTTP 429 responses are retried using the `Retry-After` value from Telegram. Transient network errors (`HttpRequestException`, socket timeouts) are retried with exponential backoff (200/400/800/1600 ms). Non-retryable errors (e.g. 400 Bad Request for malformed Markdown) propagate as `ApiRequestException`.
+
 #### Callback queries
 
-When a user presses an inline button, TelegramServer converts the callback into a `response` message with correlation to the original message ID.
+When a user presses an inline button, TelegramServer maps the Telegram `message_id` to the AgentParty `Message.Id` and raises a `response` message for correlation. The mapping is per-chat, capped at `SentMessagesPerClientMaxSize` entries (FIFO). Presses on unknown or evicted buttons are silently ignored — no `MessageReceived` is raised.
+
+To reset the button mapping for a client (e.g. when starting a new agent session):
+
+```csharp
+telegramServer.ClearSentMessagesForClient(clientId);
+```
 
 #### No TelegramClient
 
@@ -467,7 +491,7 @@ public interface IMessage
     string Type { get; }         // Message type (see MessageTypes)
     string Content { get; }      // Content (string for text, JSON for structured types)
     string ClientId { get; }     // Sender (incoming) or recipient (outgoing)
-    DateTime Timestamp { get; }  // Creation time (UTC)
+    DateTime Timestamp { get; }  // Creation time (UTC); wire format: "2026-04-17T09:42:13Z" (ISO-8601 UTC, second precision)
 }
 ```
 
@@ -513,6 +537,8 @@ public interface IClient : IDisposable
 ```csharp
 public class Router : IServer
 {
+    public Router(IRawLogger? rawLogger = null);
+
     public void Register(IServer server);
     public void Unregister(IServer server);
 
@@ -589,6 +615,14 @@ Unlikely (Telegram uses numeric `chatId`, file clients use GUIDs, console uses `
 - `Router.Dispose()` stops and disposes all registered servers.
 - To keep a server alive — `Unregister` before disposing the Router.
 
+### Inline Button Lifecycle
+
+Inline-button mappings (`choice` / `list` action items) are stored in memory only. After a process restart, all mappings are lost. Pressing a button from a previous session is silently ignored — no `MessageReceived` is raised. To explicitly reset mappings within the same process (e.g. when starting a new session), call `TelegramServer.ClearSentMessagesForClient(clientId)`.
+
+### Subscriber Exception Isolation
+
+Exceptions thrown by `MessageReceived` or `FeedReceived` subscribers do not propagate to the transport. Each subscriber is called independently — an exception in one does not prevent others from receiving the message. Exceptions are logged via `IRawLogger` if provided to `Router` or the individual server.
+
 ---
 
 ## Feed
@@ -602,10 +636,12 @@ public interface IFeedMessage
 {
     string Content { get; }      // Text content (always a string, no JSON wrapping)
     string? Author { get; }      // Optional author
-    DateTime Timestamp { get; }  // Creation time (UTC)
+    DateTime Timestamp { get; }  // Creation time (UTC); wire format: "2026-04-17T09:42:13Z" (ISO-8601 UTC, second precision)
     string Source { get; }       // Source identifier (e.g. Telegram chatId, file-based tag)
 }
 ```
+
+> **Breaking change (v0.8):** The `timestamp` field in feed JSON files was previously serialized as a Unix timestamp integer (e.g. `1744881733`). It is now ISO-8601 UTC to-the-second (e.g. `"2026-04-17T09:42:13Z"`). Feed files written by older versions will fail to deserialize. No migration is provided — AgentParty v0.x does not guarantee feed persistence across versions.
 
 Feed messages have no `Id`, `Type`, or `ClientId` — they are units of information, not protocol messages. `Source` is a transport-level identifier: TelegramServer sets it to `chatId.ToString()`, FileServer deserializes it from JSON. The library does not validate or interpret the value — semantics are defined by the consumer.
 
@@ -656,9 +692,10 @@ Directory structure with feed:
 
 ```
 {Directory}/
-  incoming/    <-- client writes messages, server reads
-  outgoing/    <-- server writes messages, client reads
-  feed/        <-- client writes feed, server reads
+  incoming/              <-- client writes messages, server reads
+  outgoing/
+    {clientId}/          <-- server writes per-client; client reads own subdirectory only
+  feed/                  <-- client writes feed, server reads
 ```
 
 ---

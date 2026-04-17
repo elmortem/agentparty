@@ -1,5 +1,6 @@
 using AgentParty.Content;
 using Telegram.Bot;
+using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
 namespace AgentParty.Telegram;
@@ -13,37 +14,40 @@ public class TelegramRenderer
         _config = config;
     }
 
-    public virtual async Task RenderAsync(ITelegramBotClient botClient, long chatId, IMessage message,
-        Action<int, string>? trackSentMessage = null, CancellationToken cancellationToken = default)
+    public virtual async Task RenderAsync(ITelegramBotClient botClient, TelegramRateLimiter limiter, long chatId,
+        IMessage message, Action<int, string>? trackSentMessage = null, CancellationToken cancellationToken = default)
     {
         switch (message.Type)
         {
             case MessageTypes.Text:
-                await botClient.SendMessage(chatId, message.Content, cancellationToken: cancellationToken);
+                await limiter.ExecuteAsync(chatId,
+                    ct => botClient.SendMessage(chatId, message.Content, parseMode: ParseMode.Markdown, cancellationToken: ct),
+                    cancellationToken);
                 break;
 
             case MessageTypes.Choice:
-                await RenderChoiceAsync(botClient, chatId, message, trackSentMessage, cancellationToken);
+                await RenderChoiceAsync(botClient, limiter, chatId, message, trackSentMessage, cancellationToken);
                 break;
 
             case MessageTypes.List:
-                await RenderListAsync(botClient, chatId, message, trackSentMessage, cancellationToken);
+                await RenderListAsync(botClient, limiter, chatId, message, trackSentMessage, cancellationToken);
                 break;
 
             case MessageTypes.Notification:
-                await RenderNotificationAsync(botClient, chatId, message, cancellationToken);
+                await RenderNotificationAsync(botClient, limiter, chatId, message, cancellationToken);
                 break;
 
             default:
-                // Fallback — send content as text
                 if (!string.IsNullOrEmpty(message.Content))
-                    await botClient.SendMessage(chatId, message.Content, cancellationToken: cancellationToken);
+                    await limiter.ExecuteAsync(chatId,
+                        ct => botClient.SendMessage(chatId, message.Content, parseMode: ParseMode.Markdown, cancellationToken: ct),
+                        cancellationToken);
                 break;
         }
     }
 
-    protected virtual async Task RenderChoiceAsync(ITelegramBotClient botClient, long chatId, IMessage message,
-        Action<int, string>? trackSentMessage, CancellationToken cancellationToken)
+    private async Task RenderChoiceAsync(ITelegramBotClient botClient, TelegramRateLimiter limiter,
+        long chatId, IMessage message, Action<int, string>? trackSentMessage, CancellationToken cancellationToken)
     {
         var choice = ChoiceContent.Parse(message.Content);
         var buttons = choice.Options
@@ -51,24 +55,25 @@ public class TelegramRenderer
             .ToArray();
         var markup = new InlineKeyboardMarkup(buttons);
 
-        var sent = await botClient.SendMessage(chatId, choice.Text,
-            replyMarkup: markup, cancellationToken: cancellationToken);
+        var sent = await limiter.ExecuteAsync(chatId,
+            ct => botClient.SendMessage(chatId, choice.Text, parseMode: ParseMode.Markdown,
+                replyMarkup: markup, cancellationToken: ct),
+            cancellationToken);
         trackSentMessage?.Invoke(sent.MessageId, message.Id);
     }
 
-    protected virtual async Task RenderListAsync(ITelegramBotClient botClient, long chatId, IMessage message,
-        Action<int, string>? trackSentMessage, CancellationToken cancellationToken)
+    private async Task RenderListAsync(ITelegramBotClient botClient, TelegramRateLimiter limiter,
+        long chatId, IMessage message, Action<int, string>? trackSentMessage, CancellationToken cancellationToken)
     {
         var list = ListContent.Parse(message.Content);
         var infoItems = list.Items.Where(i => i.Actions is null or { Length: 0 }).ToList();
         var actionItems = list.Items.Where(i => i.Actions is { Length: > 0 }).ToList();
 
-        // Info items — single text message
         if (infoItems.Count > 0)
         {
             var lines = new List<string>();
             if (!string.IsNullOrEmpty(list.Title))
-                lines.Add($"<b>{list.Title}</b>");
+                lines.Add($"*{list.Title}*");
             foreach (var item in infoItems)
             {
                 var line = $"• {item.Text}";
@@ -76,11 +81,12 @@ public class TelegramRenderer
                     line += $" — {item.Details}";
                 lines.Add(line);
             }
-            await botClient.SendMessage(chatId, string.Join("\n", lines),
-                parseMode: global::Telegram.Bot.Types.Enums.ParseMode.Html, cancellationToken: cancellationToken);
+            await limiter.ExecuteAsync(chatId,
+                ct => botClient.SendMessage(chatId, string.Join("\n", lines),
+                    parseMode: ParseMode.Markdown, cancellationToken: ct),
+                cancellationToken);
         }
 
-        // Action items — each as a separate message with inline buttons
         foreach (var item in actionItems)
         {
             var text = item.Text;
@@ -92,31 +98,36 @@ public class TelegramRenderer
                 .ToArray();
             var markup = new InlineKeyboardMarkup(buttons);
 
-            var sent = await botClient.SendMessage(chatId, text,
-                replyMarkup: markup, cancellationToken: cancellationToken);
+            var sent = await limiter.ExecuteAsync(chatId,
+                ct => botClient.SendMessage(chatId, text, parseMode: ParseMode.Markdown,
+                    replyMarkup: markup, cancellationToken: ct),
+                cancellationToken);
             trackSentMessage?.Invoke(sent.MessageId, message.Id);
         }
     }
 
-    protected virtual async Task RenderNotificationAsync(ITelegramBotClient botClient, long chatId, IMessage message,
-        CancellationToken cancellationToken)
+    private async Task RenderNotificationAsync(ITelegramBotClient botClient, TelegramRateLimiter limiter,
+        long chatId, IMessage message, CancellationToken cancellationToken)
     {
         var notification = NotificationContent.Parse(message.Content);
         switch (notification.Kind)
         {
             case "thinking":
-                await botClient.SendChatAction(chatId, global::Telegram.Bot.Types.Enums.ChatAction.Typing,
-                    cancellationToken: cancellationToken);
+                await limiter.ExecuteAsync(chatId,
+                    ct => botClient.SendChatAction(chatId, ChatAction.Typing, cancellationToken: ct),
+                    cancellationToken);
                 break;
             case "attention":
                 if (!string.IsNullOrEmpty(_config.BotName))
-                    await botClient.SetMyName(_config.BotName + _config.AttentionMarker,
-                        cancellationToken: cancellationToken);
+                    await limiter.ExecuteAsync(null,
+                        ct => botClient.SetMyName(_config.BotName + _config.AttentionMarker, cancellationToken: ct),
+                        cancellationToken);
                 break;
             case "attention_clear":
                 if (!string.IsNullOrEmpty(_config.BotName))
-                    await botClient.SetMyName(_config.BotName,
-                        cancellationToken: cancellationToken);
+                    await limiter.ExecuteAsync(null,
+                        ct => botClient.SetMyName(_config.BotName, cancellationToken: ct),
+                        cancellationToken);
                 break;
         }
     }

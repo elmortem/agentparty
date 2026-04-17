@@ -4,7 +4,10 @@
       "WebSearch",
       "Bash(dotnet test:*)",
       "Bash(dotnet restore:*)",
-      "Bash(dotnet build:*)"
+      "Bash(dotnet build:*)",
+      "Read(//c/Users/elmortem/.nuget/packages/telegram.bot/**)",
+      "Bash(find /root -name \"telegram.bot*\" -maxdepth 10)",
+      "Bash(dotnet list *)"
     ]
   }
 }

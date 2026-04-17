@@ -9,4 +9,6 @@ public class TelegramServerConfig
     public HashSet<long> AllowedUserIds { get; set; } = new();
     public HashSet<FeedSource> FeedSources { get; set; } = new();
     public bool FeedDiscoveryMode { get; set; }
+    public int SentMessagesPerClientMaxSize { get; set; } = 100;
+    public TelegramRateLimitOptions RateLimit { get; set; } = new();
 }

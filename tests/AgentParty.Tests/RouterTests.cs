@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using AgentParty.Content;
 
@@ -13,18 +14,26 @@ public class RouterTests
         public int StartCount { get; private set; }
         public int StopCount { get; private set; }
         public bool IsDisposed { get; private set; }
+        public bool ThrowOnSend { get; set; }
         public HashSet<string> AllowedCommands { get; set; } = new();
 
         public Task StartAsync(CancellationToken cancellationToken = default) { StartCount++; return Task.CompletedTask; }
         public Task StopAsync(CancellationToken cancellationToken = default) { StopCount++; return Task.CompletedTask; }
         public Task SendAsync(string clientId, IMessage message, CancellationToken cancellationToken = default)
         {
+            if (ThrowOnSend) throw new InvalidOperationException("send failed");
             Sent.Add((clientId, message));
             return Task.CompletedTask;
         }
         public void SimulateMessage(IMessage message) => MessageReceived?.Invoke(message);
         public void SimulateFeed(IFeedMessage feedMessage) => FeedReceived?.Invoke(feedMessage);
         public void Dispose() => IsDisposed = true;
+    }
+
+    private class FakeLogger : IRawLogger
+    {
+        public ConcurrentBag<(string Source, string Data)> Entries { get; } = new();
+        public void Log(string source, string rawData) => Entries.Add((source, rawData));
     }
 
     private static Message MakeMessage(string clientId = "c1") => new()
@@ -236,7 +245,7 @@ public class RouterTests
         server.SimulateMessage(msg);
 
         Assert.Null(received);
-        // Error message sent back to client
+        SpinWait.SpinUntil(() => server.Sent.Count > 0, TimeSpan.FromSeconds(1));
         Assert.Single(server.Sent);
         Assert.Equal(MessageTypes.Text, server.Sent[0].Message.Type);
         Assert.Contains("'shutdown'", server.Sent[0].Message.Content);
@@ -264,6 +273,7 @@ public class RouterTests
         server.SimulateMessage(msg);
 
         Assert.Null(received);
+        SpinWait.SpinUntil(() => server.Sent.Count > 0, TimeSpan.FromSeconds(1));
         Assert.Single(server.Sent);
     }
 
@@ -360,5 +370,148 @@ public class RouterTests
 
         Assert.Single(feeds);
         Assert.Equal("before unregister", feeds[0].Content);
+    }
+
+    // --- Thread-safety and resilience tests ---
+
+    [Fact]
+    public async Task ConcurrentMessages_FromMultipleServers_DontCorruptRoutingTable()
+    {
+        var s1 = new FakeServer();
+        var s2 = new FakeServer();
+        var router = new Router();
+        router.Register(s1);
+        router.Register(s2);
+        await router.StartAsync();
+
+        var t1 = Task.Run(() =>
+        {
+            for (int i = 0; i < 1000; i++)
+                s1.SimulateMessage(MakeMessage($"s1-client-{i}"));
+        });
+        var t2 = Task.Run(() =>
+        {
+            for (int i = 0; i < 1000; i++)
+                s2.SimulateMessage(MakeMessage($"s2-client-{i}"));
+        });
+        await Task.WhenAll(t1, t2);
+
+        var ex = await Record.ExceptionAsync(() => router.SendAsync("s1-client-0", MakeMessage("s1-client-0")));
+        Assert.Null(ex);
+    }
+
+    [Fact]
+    public void BlockedCommand_DoesNotThrowOnTransportThread()
+    {
+        var server = new FakeServer { AllowedCommands = new() { "status" } };
+        var router = new Router();
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        var msg = new Message
+        {
+            Type = MessageTypes.Command,
+            Content = new CommandContent { Name = "shutdown" }.Serialize(),
+            ClientId = "c1"
+        };
+
+        var ex = Record.Exception(() => server.SimulateMessage(msg));
+        Assert.Null(ex);
+
+        SpinWait.SpinUntil(() => server.Sent.Count > 0, TimeSpan.FromSeconds(1));
+        Assert.Single(server.Sent);
+        Assert.Equal(MessageTypes.Text, server.Sent[0].Message.Type);
+    }
+
+    [Fact]
+    public void SubscriberException_DoesNotPropagate()
+    {
+        var server = new FakeServer();
+        var logger = new FakeLogger();
+        var router = new Router(logger);
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        router.MessageReceived += _ => throw new InvalidOperationException("boom");
+
+        var ex = Record.Exception(() => server.SimulateMessage(MakeMessage()));
+        Assert.Null(ex);
+        Assert.NotEmpty(logger.Entries);
+    }
+
+    [Fact]
+    public void SubscriberException_DoesNotBlockOtherSubscribers()
+    {
+        var server = new FakeServer();
+        var router = new Router();
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        IMessage? secondReceived = null;
+        router.MessageReceived += _ => throw new InvalidOperationException("first fails");
+        router.MessageReceived += m => secondReceived = m;
+
+        var msg = MakeMessage();
+        server.SimulateMessage(msg);
+
+        Assert.NotNull(secondReceived);
+        Assert.Equal(msg.Content, secondReceived.Content);
+    }
+
+    [Fact]
+    public void FeedSubscriberException_DoesNotPropagate()
+    {
+        var server = new FakeServer();
+        var logger = new FakeLogger();
+        var router = new Router(logger);
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        router.FeedReceived += _ => throw new InvalidOperationException("boom");
+
+        var ex = Record.Exception(() => server.SimulateFeed(new FeedMessage { Content = "test" }));
+        Assert.Null(ex);
+        Assert.NotEmpty(logger.Entries);
+    }
+
+    [Fact]
+    public void FeedSubscriberException_DoesNotBlockOtherSubscribers()
+    {
+        var server = new FakeServer();
+        var router = new Router();
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        IFeedMessage? secondReceived = null;
+        router.FeedReceived += _ => throw new InvalidOperationException("first fails");
+        router.FeedReceived += f => secondReceived = f;
+
+        server.SimulateFeed(new FeedMessage { Content = "test" });
+
+        Assert.NotNull(secondReceived);
+        Assert.Equal("test", secondReceived.Content);
+    }
+
+    [Fact]
+    public void BlockedCommand_SendAsyncFailure_DoesNotCrash()
+    {
+        var server = new FakeServer { AllowedCommands = new() { "status" }, ThrowOnSend = true };
+        var logger = new FakeLogger();
+        var router = new Router(logger);
+        router.Register(server);
+        router.StartAsync().GetAwaiter().GetResult();
+
+        var msg = new Message
+        {
+            Type = MessageTypes.Command,
+            Content = new CommandContent { Name = "shutdown" }.Serialize(),
+            ClientId = "c1"
+        };
+
+        var ex = Record.Exception(() => server.SimulateMessage(msg));
+        Assert.Null(ex);
+
+        SpinWait.SpinUntil(() => !logger.Entries.IsEmpty, TimeSpan.FromSeconds(1));
+        Assert.NotEmpty(logger.Entries);
     }
 }

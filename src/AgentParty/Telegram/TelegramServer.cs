@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Text.Json;
 using AgentParty.Content;
 using Telegram.Bot;
@@ -13,9 +12,11 @@ public class TelegramServer : IServer
     private readonly TelegramServerConfig _config;
     private readonly TelegramRenderer _renderer;
     private readonly IRawLogger? _rawLogger;
-    private readonly ConcurrentDictionary<int, string> _sentMessageMap = new(); // telegramMsgId → agentPartyMsgId
-    private TelegramBotClient? _botClient;
+    private readonly SentMessageMap _sentMessages;
+    private readonly TelegramRateLimiter _limiter;
+    private ITelegramBotClient? _botClient;
     private CancellationTokenSource? _cts;
+    private Task? _pollingTask;
     private bool _isRunning;
     private bool _disposed;
 
@@ -24,11 +25,15 @@ public class TelegramServer : IServer
 
     public HashSet<string> AllowedCommands => _config.AllowedCommands;
 
+    internal SentMessageMap SentMessages => _sentMessages;
+
     public TelegramServer(TelegramServerConfig config, TelegramRenderer? renderer = null, IRawLogger? rawLogger = null)
     {
         _config = config;
         _renderer = renderer ?? new TelegramRenderer(config);
         _rawLogger = rawLogger;
+        _sentMessages = new SentMessageMap(config.SentMessagesPerClientMaxSize);
+        _limiter = new TelegramRateLimiter(config.RateLimit, rawLogger);
     }
 
     public Task StartAsync(CancellationToken cancellationToken = default)
@@ -36,41 +41,42 @@ public class TelegramServer : IServer
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_isRunning) return Task.CompletedTask;
 
-        _botClient = new TelegramBotClient(_config.BotToken);
+        _botClient = CreateBotClient(_config.BotToken);
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
-        _botClient.StartReceiving(
-            updateHandler: HandleUpdateAsync,
-            errorHandler: HandleErrorAsync,
-            receiverOptions: new ReceiverOptions
-            {
-                AllowedUpdates =
-                [
-                    UpdateType.Message,
-                    UpdateType.CallbackQuery,
-                    UpdateType.ChannelPost,
-                    UpdateType.EditedMessage,
-                    UpdateType.EditedChannelPost
-                ]
-            },
-            cancellationToken: _cts.Token
-        );
+        var options = new ReceiverOptions
+        {
+            AllowedUpdates =
+            [
+                UpdateType.Message,
+                UpdateType.CallbackQuery,
+                UpdateType.ChannelPost,
+                UpdateType.EditedMessage,
+                UpdateType.EditedChannelPost
+            ]
+        };
+        _pollingTask = RunPollingAsync(_botClient, options, _cts.Token);
 
         _isRunning = true;
         return Task.CompletedTask;
     }
 
-    public Task StopAsync(CancellationToken cancellationToken = default)
+    public async Task StopAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        if (!_isRunning) return Task.CompletedTask;
+        if (!_isRunning) return;
 
-        _isRunning = false;
         _cts?.Cancel();
+        if (_pollingTask != null)
+        {
+            try { await _pollingTask; }
+            catch (OperationCanceledException) { }
+        }
         _cts?.Dispose();
         _cts = null;
-
-        return Task.CompletedTask;
+        _pollingTask = null;
+        _botClient = null;
+        _isRunning = false;
     }
 
     public async Task SendAsync(string clientId, IMessage message, CancellationToken cancellationToken = default)
@@ -80,12 +86,23 @@ public class TelegramServer : IServer
             throw new InvalidOperationException("TelegramServer is not running.");
 
         var chatId = long.Parse(clientId);
-        await _renderer.RenderAsync(_botClient, chatId, message,
-            trackSentMessage: (telegramMsgId, agentPartyMsgId) => _sentMessageMap[telegramMsgId] = agentPartyMsgId,
+        await _renderer.RenderAsync(_botClient, _limiter, chatId, message,
+            trackSentMessage: (telegramMsgId, agentPartyMsgId) => _sentMessages.Set(clientId, telegramMsgId, agentPartyMsgId),
             cancellationToken: cancellationToken);
     }
 
-    private Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
+    public void ClearSentMessagesForClient(string clientId)
+    {
+        _sentMessages.Clear(clientId);
+    }
+
+    protected virtual ITelegramBotClient CreateBotClient(string token)
+        => new TelegramBotClient(token);
+
+    protected virtual Task RunPollingAsync(ITelegramBotClient botClient, ReceiverOptions options, CancellationToken cancellationToken)
+        => botClient.ReceiveAsync(HandleUpdateAsync, HandleErrorAsync, options, cancellationToken);
+
+    internal Task HandleUpdateAsync(ITelegramBotClient botClient, Update update, CancellationToken cancellationToken)
     {
         _rawLogger?.Log("TelegramServer.Update", JsonSerializer.Serialize(update));
 
@@ -103,7 +120,6 @@ public class TelegramServer : IServer
         // 3. Route by chat type
         if (msg.Chat.Type == ChatType.Private)
         {
-            // Private chat → AllowedUserIds → MessageReceived
             var userId = msg.From?.Id;
             if (_config.AllowedUserIds.Count > 0 && (!userId.HasValue || !_config.AllowedUserIds.Contains(userId.Value)))
                 return Task.CompletedTask;
@@ -132,7 +148,7 @@ public class TelegramServer : IServer
         return Task.CompletedTask;
     }
 
-    private void HandleFeedUpdate(global::Telegram.Bot.Types.Message msg, FeedSource feedSource)
+    internal void HandleFeedUpdate(global::Telegram.Bot.Types.Message msg, FeedSource feedSource)
     {
         var content = msg.Text ?? msg.Caption ?? msg.Document?.FileName;
         if (content == null) return;
@@ -148,21 +164,20 @@ public class TelegramServer : IServer
         });
     }
 
-    private void HandleCallbackQuery(CallbackQuery callbackQuery)
+    internal void HandleCallbackQuery(CallbackQuery callbackQuery)
     {
         if (callbackQuery.Message is null || callbackQuery.Data is null)
             return;
 
         var chatId = callbackQuery.Message.Chat.Id;
         var telegramMsgId = callbackQuery.Message.MessageId;
+        var clientId = chatId.ToString();
 
-        // Find the original AgentParty message ID
-        _sentMessageMap.TryGetValue(telegramMsgId, out var originalMsgId);
-        originalMsgId ??= telegramMsgId.ToString();
+        if (!_sentMessages.TryGet(clientId, telegramMsgId, out var originalMsgId))
+            return; // silent ignore
 
         ResponseContent responseContent;
 
-        // Check if it's a list item action (format: "itemId:actionId")
         if (callbackQuery.Data.Contains(':'))
         {
             var parts = callbackQuery.Data.Split(':', 2);
@@ -185,7 +200,7 @@ public class TelegramServer : IServer
         {
             Type = MessageTypes.Response,
             Content = responseContent.Serialize(),
-            ClientId = chatId.ToString()
+            ClientId = clientId
         };
 
         MessageReceived?.Invoke(message);
@@ -193,16 +208,17 @@ public class TelegramServer : IServer
 
     private Task HandleErrorAsync(ITelegramBotClient botClient, Exception exception, CancellationToken cancellationToken)
     {
-        // Polling errors are transient — Telegram.Bot will retry automatically
         return Task.CompletedTask;
     }
 
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
 
         if (_isRunning)
             StopAsync().GetAwaiter().GetResult();
+
+        _limiter.Dispose();
+        _disposed = true;
     }
 }

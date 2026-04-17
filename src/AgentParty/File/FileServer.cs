@@ -9,6 +9,8 @@ public class FileServer : IServer
     private readonly string _incomingDir;
     private readonly string _outgoingDir;
     private readonly string _feedDir;
+    private readonly SemaphoreSlim _incomingLock = new(1, 1);
+    private readonly SemaphoreSlim _feedLock = new(1, 1);
     private FileSystemWatcher? _watcher;
     private FileSystemWatcher? _feedWatcher;
     private CancellationTokenSource? _cts;
@@ -38,26 +40,43 @@ public class FileServer : IServer
         System.IO.Directory.CreateDirectory(_outgoingDir);
         System.IO.Directory.CreateDirectory(_feedDir);
 
+        CleanupTempFiles(_outgoingDir, recursive: true);
+
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
         _watcher = new FileSystemWatcher(_incomingDir, "*.json")
         {
             EnableRaisingEvents = true
         };
-        _watcher.Created += (_, _) => ProcessIncomingFiles();
+        _watcher.Created += (_, _) =>
+        {
+            var cts = _cts;
+            if (cts != null)
+                _ = ProcessIncomingFilesAsync(cts.Token);
+        };
 
         _feedWatcher = new FileSystemWatcher(_feedDir, "*.json")
         {
             EnableRaisingEvents = true
         };
-        _feedWatcher.Created += (_, _) => ProcessFeedFiles();
+        _feedWatcher.Created += (_, _) =>
+        {
+            var cts = _cts;
+            if (cts != null)
+                _ = ProcessFeedFilesAsync(cts.Token);
+        };
 
         _pollingTask = Task.Run(async () =>
         {
             while (!_cts.Token.IsCancellationRequested)
             {
-                ProcessIncomingFiles();
-                ProcessFeedFiles();
+                try
+                {
+                    await ProcessIncomingFilesAsync(_cts.Token);
+                    await ProcessFeedFilesAsync(_cts.Token);
+                }
+                catch (OperationCanceledException) { break; }
+
                 try { await Task.Delay(_config.PollingIntervalMs, _cts.Token); }
                 catch (OperationCanceledException) { break; }
             }
@@ -90,7 +109,7 @@ public class FileServer : IServer
         _cts = null;
     }
 
-    public Task SendAsync(string clientId, IMessage message, CancellationToken cancellationToken = default)
+    public async Task SendAsync(string clientId, IMessage message, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!_isRunning)
@@ -107,92 +126,110 @@ public class FileServer : IServer
 
         var json = JsonSerializer.Serialize(envelope);
         var guid = Guid.NewGuid().ToString();
-        var tmpPath = Path.Combine(_outgoingDir, $"{guid}.tmp");
-        var jsonPath = Path.Combine(_outgoingDir, $"{guid}.json");
+        var clientDir = Path.Combine(_outgoingDir, clientId);
+        System.IO.Directory.CreateDirectory(clientDir);
+        var tmpPath = Path.Combine(clientDir, $"{guid}.tmp");
+        var jsonPath = Path.Combine(clientDir, $"{guid}.json");
 
-        System.IO.File.WriteAllText(tmpPath, json);
+        await System.IO.File.WriteAllTextAsync(tmpPath, json, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         System.IO.File.Move(tmpPath, jsonPath);
-
-        return Task.CompletedTask;
     }
 
-    private void ProcessIncomingFiles()
+    internal async Task ProcessIncomingFilesAsync(CancellationToken ct)
     {
         if (_disposed || !_isRunning) return;
-
+        if (!await _incomingLock.WaitAsync(0, ct)) return;
         try
         {
             var files = new DirectoryInfo(_incomingDir)
                 .GetFiles("*.json")
                 .OrderBy(f => f.CreationTimeUtc)
-                .ToList();
+                .ToArray();
 
             foreach (var file in files)
             {
+                ct.ThrowIfCancellationRequested();
+
+                string content;
+                try { content = await System.IO.File.ReadAllTextAsync(file.FullName, ct); }
+                catch (FileNotFoundException) { continue; }
+                catch (IOException) { continue; }
+
+                try { System.IO.File.Delete(file.FullName); }
+                catch (FileNotFoundException) { }
+                catch (IOException) { continue; }
+
+                _rawLogger?.Log("FileServer.Incoming", content);
+
                 try
                 {
-                    var json = System.IO.File.ReadAllText(file.FullName);
-                    System.IO.File.Delete(file.FullName);
-
-                    _rawLogger?.Log("FileServer.Incoming", json);
-
-                    var message = JsonSerializer.Deserialize<Message>(json);
+                    var message = JsonSerializer.Deserialize<Message>(content);
                     if (message != null)
                         MessageReceived?.Invoke(message);
                 }
-                catch (IOException)
-                {
-                    // File may be in use or already deleted — skip, pick up on next poll
-                }
-                catch (JsonException)
-                {
-                    // Malformed file — skip
-                }
+                catch (JsonException) { }
             }
         }
-        catch (DirectoryNotFoundException)
+        catch (DirectoryNotFoundException) { }
+        finally
         {
-            // Directory removed externally
+            _incomingLock.Release();
         }
     }
 
-    private void ProcessFeedFiles()
+    internal async Task ProcessFeedFilesAsync(CancellationToken ct)
     {
         if (_disposed || !_isRunning) return;
-
+        if (!await _feedLock.WaitAsync(0, ct)) return;
         try
         {
             var files = new DirectoryInfo(_feedDir)
                 .GetFiles("*.json")
                 .OrderBy(f => f.CreationTimeUtc)
-                .ToList();
+                .ToArray();
 
             foreach (var file in files)
             {
+                ct.ThrowIfCancellationRequested();
+
+                string content;
+                try { content = await System.IO.File.ReadAllTextAsync(file.FullName, ct); }
+                catch (FileNotFoundException) { continue; }
+                catch (IOException) { continue; }
+
+                _rawLogger?.Log("FileServer.Feed", content);
+
                 try
                 {
-                    var json = System.IO.File.ReadAllText(file.FullName);
-
-                    _rawLogger?.Log("FileServer.Feed", json);
-
-                    var feedMessage = JsonSerializer.Deserialize<FeedMessage>(json);
+                    var feedMessage = JsonSerializer.Deserialize<FeedMessage>(content);
                     if (feedMessage != null)
                     {
                         System.IO.File.Delete(file.FullName);
                         FeedReceived?.Invoke(feedMessage);
                     }
                 }
-                catch (IOException)
-                {
-                }
                 catch (JsonException)
                 {
                     System.Console.Error.WriteLine($"[FileServer] Bad feed file: {file.Name}");
                 }
+                catch (IOException) { }
             }
         }
-        catch (DirectoryNotFoundException)
+        catch (DirectoryNotFoundException) { }
+        finally
         {
+            _feedLock.Release();
+        }
+    }
+
+    internal static void CleanupTempFiles(string dir, bool recursive)
+    {
+        if (!System.IO.Directory.Exists(dir)) return;
+        var option = recursive ? SearchOption.AllDirectories : SearchOption.TopDirectoryOnly;
+        foreach (var tmp in System.IO.Directory.GetFiles(dir, "*.tmp", option))
+        {
+            try { System.IO.File.Delete(tmp); } catch (IOException) { }
         }
     }
 

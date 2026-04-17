@@ -17,5 +17,6 @@ public class Message : IMessage
     public string ClientId { get; set; } = string.Empty;
 
     [JsonPropertyName("timestamp")]
+    [JsonConverter(typeof(UnixDateTimeConverter))]
     public DateTime Timestamp { get; set; } = DateTime.UtcNow;
 }

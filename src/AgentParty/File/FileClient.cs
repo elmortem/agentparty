@@ -6,8 +6,9 @@ public class FileClient : IClient
 {
     private readonly FileClientConfig _config;
     private readonly string _incomingDir;
-    private readonly string _outgoingDir;
+    private readonly string _myOutgoingDir;
     private readonly string _feedDir;
+    private readonly SemaphoreSlim _myOutgoingLock = new(1, 1);
     private FileSystemWatcher? _watcher;
     private CancellationTokenSource? _cts;
     private Task? _pollingTask;
@@ -20,7 +21,7 @@ public class FileClient : IClient
     {
         _config = config;
         _incomingDir = Path.Combine(config.Directory, "incoming");
-        _outgoingDir = Path.Combine(config.Directory, "outgoing");
+        _myOutgoingDir = Path.Combine(config.Directory, "outgoing", config.ClientId);
         _feedDir = Path.Combine(config.Directory, "feed");
     }
 
@@ -30,22 +31,32 @@ public class FileClient : IClient
         if (_isRunning) return Task.CompletedTask;
 
         System.IO.Directory.CreateDirectory(_incomingDir);
-        System.IO.Directory.CreateDirectory(_outgoingDir);
+        System.IO.Directory.CreateDirectory(_myOutgoingDir);
         System.IO.Directory.CreateDirectory(_feedDir);
+
+        FileServer.CleanupTempFiles(_incomingDir, recursive: false);
+        FileServer.CleanupTempFiles(_feedDir, recursive: false);
 
         _cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 
-        _watcher = new FileSystemWatcher(_outgoingDir, "*.json")
+        _watcher = new FileSystemWatcher(_myOutgoingDir, "*.json")
         {
             EnableRaisingEvents = true
         };
-        _watcher.Created += (_, _) => ProcessOutgoingFiles();
+        _watcher.Created += (_, _) =>
+        {
+            var cts = _cts;
+            if (cts != null)
+                _ = ProcessOutgoingFilesAsync(cts.Token);
+        };
 
         _pollingTask = Task.Run(async () =>
         {
             while (!_cts.Token.IsCancellationRequested)
             {
-                ProcessOutgoingFiles();
+                try { await ProcessOutgoingFilesAsync(_cts.Token); }
+                catch (OperationCanceledException) { break; }
+
                 try { await Task.Delay(_config.PollingIntervalMs, _cts.Token); }
                 catch (OperationCanceledException) { break; }
             }
@@ -75,7 +86,7 @@ public class FileClient : IClient
         _cts = null;
     }
 
-    public Task SendAsync(IMessage message, CancellationToken cancellationToken = default)
+    public async Task SendAsync(IMessage message, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!_isRunning)
@@ -95,13 +106,12 @@ public class FileClient : IClient
         var tmpPath = Path.Combine(_incomingDir, $"{guid}.tmp");
         var jsonPath = Path.Combine(_incomingDir, $"{guid}.json");
 
-        System.IO.File.WriteAllText(tmpPath, json);
+        await System.IO.File.WriteAllTextAsync(tmpPath, json, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         System.IO.File.Move(tmpPath, jsonPath);
-
-        return Task.CompletedTask;
     }
 
-    public Task SendFeedAsync(IFeedMessage feedMessage, CancellationToken cancellationToken = default)
+    public async Task SendFeedAsync(IFeedMessage feedMessage, CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!_isRunning)
@@ -120,48 +130,50 @@ public class FileClient : IClient
         var tmpPath = Path.Combine(_feedDir, $"{guid}.tmp");
         var jsonPath = Path.Combine(_feedDir, $"{guid}.json");
 
-        System.IO.File.WriteAllText(tmpPath, json);
+        await System.IO.File.WriteAllTextAsync(tmpPath, json, cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         System.IO.File.Move(tmpPath, jsonPath);
-
-        return Task.CompletedTask;
     }
 
-    private void ProcessOutgoingFiles()
+    private async Task ProcessOutgoingFilesAsync(CancellationToken ct)
     {
         if (_disposed || !_isRunning) return;
-
+        if (!await _myOutgoingLock.WaitAsync(0, ct)) return;
         try
         {
-            var files = new DirectoryInfo(_outgoingDir)
+            var files = new DirectoryInfo(_myOutgoingDir)
                 .GetFiles("*.json")
                 .OrderBy(f => f.CreationTimeUtc)
-                .ToList();
+                .ToArray();
 
             foreach (var file in files)
             {
+                ct.ThrowIfCancellationRequested();
+
+                string content;
+                try { content = await System.IO.File.ReadAllTextAsync(file.FullName, ct); }
+                catch (FileNotFoundException) { continue; }
+                catch (IOException) { continue; }
+
                 try
                 {
-                    var json = System.IO.File.ReadAllText(file.FullName);
-                    var message = JsonSerializer.Deserialize<Message>(json);
+                    var message = JsonSerializer.Deserialize<Message>(content);
+                    if (message == null) continue;
 
-                    if (message == null || message.ClientId != _config.ClientId)
-                        continue;
+                    if (message.ClientId != _config.ClientId)
+                        continue; // sanity: should not happen if server is correct
 
                     System.IO.File.Delete(file.FullName);
                     MessageReceived?.Invoke(message);
                 }
-                catch (IOException)
-                {
-                    // File in use or already deleted — skip
-                }
-                catch (JsonException)
-                {
-                    // Malformed — skip
-                }
+                catch (JsonException) { }
+                catch (IOException) { }
             }
         }
-        catch (DirectoryNotFoundException)
+        catch (DirectoryNotFoundException) { }
+        finally
         {
+            _myOutgoingLock.Release();
         }
     }
 

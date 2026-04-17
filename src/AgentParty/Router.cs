@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text.Json;
 using AgentParty.Content;
 
@@ -5,8 +6,10 @@ namespace AgentParty;
 
 public class Router : IServer
 {
+    private readonly object _lock = new();
+    private readonly IRawLogger? _rawLogger;
     private readonly List<IServer> _servers = new();
-    private readonly Dictionary<string, IServer> _routingTable = new();
+    private readonly ConcurrentDictionary<string, IServer> _routingTable = new();
     private readonly Dictionary<IServer, Action<IMessage>> _handlers = new();
     private readonly Dictionary<IServer, Action<IFeedMessage>> _feedHandlers = new();
     private bool _isRunning;
@@ -15,12 +18,19 @@ public class Router : IServer
     public event Action<IMessage>? MessageReceived;
     public event Action<IFeedMessage>? FeedReceived;
 
+    public Router(IRawLogger? rawLogger = null)
+    {
+        _rawLogger = rawLogger;
+    }
+
     public HashSet<string> AllowedCommands
     {
         get
         {
+            IServer[] snapshot;
+            lock (_lock) { snapshot = _servers.ToArray(); }
             var combined = new HashSet<string>();
-            foreach (var server in _servers)
+            foreach (var server in snapshot)
                 combined.UnionWith(server.AllowedCommands);
             return combined;
         }
@@ -30,47 +40,53 @@ public class Router : IServer
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        _servers.Add(server);
-
-        Action<IMessage> handler = message =>
+        bool shouldStart;
+        lock (_lock)
         {
-            _routingTable[message.ClientId] = server;
+            _servers.Add(server);
 
-            if (message.Type == MessageTypes.Command)
+            async void Handler(IMessage message)
             {
                 try
                 {
-                    var cmd = CommandContent.Parse(message.Content);
-                    if (!server.AllowedCommands.Contains(cmd.Name))
+                    _routingTable[message.ClientId] = server;
+
+                    if (message.Type == MessageTypes.Command)
                     {
-                        // Command not in whitelist — send error to client
-                        var errorMsg = new Message
+                        try
                         {
-                            Type = MessageTypes.Text,
-                            Content = $"Command '{cmd.Name}' is not allowed on this channel",
-                            ClientId = message.ClientId
-                        };
-                        server.SendAsync(message.ClientId, errorMsg).GetAwaiter().GetResult();
-                        return;
+                            var cmd = CommandContent.Parse(message.Content);
+                            if (!server.AllowedCommands.Contains(cmd.Name))
+                            {
+                                await SendBlockedCommandErrorAsync(server, message, cmd.Name);
+                                return;
+                            }
+                        }
+                        catch (JsonException)
+                        {
+                            return;
+                        }
                     }
+
+                    RaiseMessageReceived(message);
                 }
-                catch (JsonException)
+                catch (Exception ex)
                 {
-                    // Malformed command content — drop
-                    return;
+                    _rawLogger?.Log("Router.Handler", ex.ToString());
                 }
             }
 
-            MessageReceived?.Invoke(message);
-        };
-        _handlers[server] = handler;
-        server.MessageReceived += handler;
+            _handlers[server] = Handler;
+            server.MessageReceived += Handler;
 
-        Action<IFeedMessage> feedHandler = feedMessage => FeedReceived?.Invoke(feedMessage);
-        _feedHandlers[server] = feedHandler;
-        server.FeedReceived += feedHandler;
+            Action<IFeedMessage> feedHandler = feedMessage => RaiseFeedReceived(feedMessage);
+            _feedHandlers[server] = feedHandler;
+            server.FeedReceived += feedHandler;
 
-        if (_isRunning)
+            shouldStart = _isRunning;
+        }
+
+        if (shouldStart)
             server.StartAsync().GetAwaiter().GetResult();
     }
 
@@ -78,28 +94,33 @@ public class Router : IServer
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
-        if (_handlers.TryGetValue(server, out var handler))
+        bool shouldStop;
+        lock (_lock)
         {
-            server.MessageReceived -= handler;
-            _handlers.Remove(server);
+            if (_handlers.TryGetValue(server, out var handler))
+            {
+                server.MessageReceived -= handler;
+                _handlers.Remove(server);
+            }
+
+            if (_feedHandlers.TryGetValue(server, out var feedHandler))
+            {
+                server.FeedReceived -= feedHandler;
+                _feedHandlers.Remove(server);
+            }
+
+            _servers.Remove(server);
+
+            foreach (var key in _routingTable.Keys.ToArray())
+            {
+                if (_routingTable.TryGetValue(key, out var val) && val == server)
+                    _routingTable.TryRemove(key, out _);
+            }
+
+            shouldStop = _isRunning;
         }
 
-        if (_feedHandlers.TryGetValue(server, out var feedHandler))
-        {
-            server.FeedReceived -= feedHandler;
-            _feedHandlers.Remove(server);
-        }
-
-        _servers.Remove(server);
-
-        var keysToRemove = _routingTable
-            .Where(kvp => kvp.Value == server)
-            .Select(kvp => kvp.Key)
-            .ToList();
-        foreach (var key in keysToRemove)
-            _routingTable.Remove(key);
-
-        if (_isRunning)
+        if (shouldStop)
             server.StopAsync().GetAwaiter().GetResult();
     }
 
@@ -108,7 +129,10 @@ public class Router : IServer
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (_isRunning) return;
 
-        foreach (var server in _servers)
+        IServer[] snapshot;
+        lock (_lock) { snapshot = _servers.ToArray(); }
+
+        foreach (var server in snapshot)
             await server.StartAsync(cancellationToken);
 
         _isRunning = true;
@@ -121,7 +145,10 @@ public class Router : IServer
 
         _isRunning = false;
 
-        foreach (var server in _servers)
+        IServer[] snapshot;
+        lock (_lock) { snapshot = _servers.ToArray(); }
+
+        foreach (var server in snapshot)
             await server.StopAsync(cancellationToken);
     }
 
@@ -146,12 +173,60 @@ public class Router : IServer
 
         _disposed = true;
 
-        foreach (var server in _servers)
+        IServer[] snapshot;
+        lock (_lock) { snapshot = _servers.ToArray(); }
+
+        foreach (var server in snapshot)
             server.Dispose();
 
-        _servers.Clear();
-        _handlers.Clear();
-        _feedHandlers.Clear();
+        lock (_lock)
+        {
+            _servers.Clear();
+            _handlers.Clear();
+            _feedHandlers.Clear();
+        }
         _routingTable.Clear();
+    }
+
+    private async Task SendBlockedCommandErrorAsync(IServer server, IMessage message, string commandName)
+    {
+        try
+        {
+            var errorMsg = new Message
+            {
+                Type = MessageTypes.Text,
+                Content = $"Command '{commandName}' is not allowed on this channel",
+                ClientId = message.ClientId
+            };
+            await server.SendAsync(message.ClientId, errorMsg);
+        }
+        catch (Exception ex)
+        {
+            _rawLogger?.Log("Router.Handler", ex.ToString());
+        }
+    }
+
+    private void RaiseMessageReceived(IMessage message)
+    {
+        var handlers = MessageReceived;
+        if (handlers == null) return;
+
+        foreach (var handler in handlers.GetInvocationList().Cast<Action<IMessage>>())
+        {
+            try { handler(message); }
+            catch (Exception ex) { _rawLogger?.Log("Router.Subscriber", ex.ToString()); }
+        }
+    }
+
+    private void RaiseFeedReceived(IFeedMessage feedMessage)
+    {
+        var handlers = FeedReceived;
+        if (handlers == null) return;
+
+        foreach (var handler in handlers.GetInvocationList().Cast<Action<IFeedMessage>>())
+        {
+            try { handler(feedMessage); }
+            catch (Exception ex) { _rawLogger?.Log("Router.Subscriber", ex.ToString()); }
+        }
     }
 }
