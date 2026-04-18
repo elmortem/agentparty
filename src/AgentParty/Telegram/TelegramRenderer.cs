@@ -1,5 +1,6 @@
 using AgentParty.Content;
 using Telegram.Bot;
+using Telegram.Bot.Exceptions;
 using Telegram.Bot.Types.Enums;
 using Telegram.Bot.Types.ReplyMarkups;
 
@@ -20,9 +21,7 @@ public class TelegramRenderer
         switch (message.Type)
         {
             case MessageTypes.Text:
-                await limiter.ExecuteAsync(chatId,
-                    ct => botClient.SendMessage(chatId, message.Content, parseMode: ParseMode.Markdown, cancellationToken: ct),
-                    cancellationToken);
+                await SendMessageSafeAsync(botClient, limiter, chatId, message.Content, null, cancellationToken);
                 break;
 
             case MessageTypes.Choice:
@@ -39,9 +38,7 @@ public class TelegramRenderer
 
             default:
                 if (!string.IsNullOrEmpty(message.Content))
-                    await limiter.ExecuteAsync(chatId,
-                        ct => botClient.SendMessage(chatId, message.Content, parseMode: ParseMode.Markdown, cancellationToken: ct),
-                        cancellationToken);
+                    await SendMessageSafeAsync(botClient, limiter, chatId, message.Content, null, cancellationToken);
                 break;
         }
     }
@@ -55,10 +52,7 @@ public class TelegramRenderer
             .ToArray();
         var markup = new InlineKeyboardMarkup(buttons);
 
-        var sent = await limiter.ExecuteAsync(chatId,
-            ct => botClient.SendMessage(chatId, choice.Text, parseMode: ParseMode.Markdown,
-                replyMarkup: markup, cancellationToken: ct),
-            cancellationToken);
+        var sent = await SendMessageSafeAsync(botClient, limiter, chatId, choice.Text, markup, cancellationToken);
         trackSentMessage?.Invoke(sent.MessageId, message.Id);
     }
 
@@ -81,10 +75,7 @@ public class TelegramRenderer
                     line += $" — {item.Details}";
                 lines.Add(line);
             }
-            await limiter.ExecuteAsync(chatId,
-                ct => botClient.SendMessage(chatId, string.Join("\n", lines),
-                    parseMode: ParseMode.Markdown, cancellationToken: ct),
-                cancellationToken);
+            await SendMessageSafeAsync(botClient, limiter, chatId, string.Join("\n", lines), null, cancellationToken);
         }
 
         foreach (var item in actionItems)
@@ -98,11 +89,26 @@ public class TelegramRenderer
                 .ToArray();
             var markup = new InlineKeyboardMarkup(buttons);
 
-            var sent = await limiter.ExecuteAsync(chatId,
-                ct => botClient.SendMessage(chatId, text, parseMode: ParseMode.Markdown,
-                    replyMarkup: markup, cancellationToken: ct),
-                cancellationToken);
+            var sent = await SendMessageSafeAsync(botClient, limiter, chatId, text, markup, cancellationToken);
             trackSentMessage?.Invoke(sent.MessageId, message.Id);
+        }
+    }
+
+    private async Task<global::Telegram.Bot.Types.Message> SendMessageSafeAsync(
+        ITelegramBotClient botClient, TelegramRateLimiter limiter, long chatId, string text,
+        ReplyMarkup? markup, CancellationToken ct)
+    {
+        try
+        {
+            return await limiter.ExecuteAsync(chatId,
+                c => botClient.SendMessage(chatId, text, parseMode: ParseMode.Markdown, replyMarkup: markup, cancellationToken: c),
+                ct);
+        }
+        catch (ApiRequestException ex) when (ex.ErrorCode == 400)
+        {
+            return await limiter.ExecuteAsync(chatId,
+                c => botClient.SendMessage(chatId, TelegramMarkdown.Strip(text), replyMarkup: markup, cancellationToken: c),
+                ct);
         }
     }
 

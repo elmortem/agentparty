@@ -15,4 +15,15 @@ public static class TelegramMarkdown
         }
         return sb.ToString();
     }
+
+    public static string Strip(string text)
+    {
+        var sb = new StringBuilder(text.Length);
+        foreach (var c in text)
+        {
+            if (c is not ('*' or '_' or '[' or ']' or '`' or '\\'))
+                sb.Append(c);
+        }
+        return sb.ToString();
+    }
 }

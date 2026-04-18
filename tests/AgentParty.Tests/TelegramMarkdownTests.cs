@@ -22,4 +22,23 @@ public class TelegramMarkdownTests
     {
         Assert.Equal("", TelegramMarkdown.Escape(""));
     }
+
+    [Fact]
+    public void Strip_RemovesMarkdownChars()
+    {
+        Assert.Equal("Hello world", TelegramMarkdown.Strip("*Hello* _world_"));
+    }
+
+    [Fact]
+    public void Strip_LeavesNonMarkdownCharsAsIs()
+    {
+        var input = "Hello, world! 123";
+        Assert.Equal(input, TelegramMarkdown.Strip(input));
+    }
+
+    [Fact]
+    public void Strip_EmptyString_ReturnsEmpty()
+    {
+        Assert.Equal("", TelegramMarkdown.Strip(""));
+    }
 }

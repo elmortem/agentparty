@@ -14,6 +14,39 @@ public class TelegramRendererTests
     private static TelegramRateLimiter NoThrottleLimiter() =>
         new(new TelegramRateLimitOptions { GlobalPerSecond = 100, PerChatPerSecond = 100 });
 
+    private class MarkdownFailingBotClient : ITelegramBotClient
+    {
+        public List<object> Requests { get; } = new();
+
+        public long BotId => 0;
+        public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(100);
+        public IExceptionParser ExceptionsParser { get; set; } = null!;
+        public bool LocalBotServer => false;
+
+        public event AsyncEventHandler<ApiRequestEventArgs>? OnMakingApiRequest { add { } remove { } }
+        public event AsyncEventHandler<ApiResponseEventArgs>? OnApiResponseReceived { add { } remove { } }
+
+        public Task<TResponse> SendRequest<TResponse>(IRequest<TResponse> request, CancellationToken cancellationToken = default)
+        {
+            var parseMode = request.GetType().GetProperty("ParseMode")?.GetValue(request);
+            if (parseMode is ParseMode.Markdown)
+                throw new ApiRequestException("can't parse entities", 400);
+
+            Requests.Add(request);
+            if (typeof(TResponse) == typeof(Message))
+                return Task.FromResult((TResponse)(object)new Message());
+            return Task.FromResult(default(TResponse)!);
+        }
+
+        public Task<bool> TestApi(CancellationToken cancellationToken = default) => Task.FromResult(true);
+
+        public Task DownloadFile(string filePath, Stream destination, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+
+        public Task DownloadFile(TGFile file, Stream destination, CancellationToken cancellationToken = default)
+            => Task.CompletedTask;
+    }
+
     private class RecordingBotClient : ITelegramBotClient
     {
         public List<object> Requests { get; } = new();
@@ -120,6 +153,22 @@ public class TelegramRendererTests
         Assert.Equal(2, bot.Requests.Count);
         foreach (var req in bot.Requests)
             Assert.Equal(ParseMode.Markdown, GetParseMode(req));
+    }
+
+    [Fact]
+    public async Task RenderText_FallsBackToPlainText_OnMarkdownParseError()
+    {
+        var bot = new MarkdownFailingBotClient();
+        using var limiter = NoThrottleLimiter();
+        var renderer = new TelegramRenderer(new TelegramServerConfig { BotToken = "t" });
+        var msg = new AgentParty.Message { Type = MessageTypes.Text, Content = "Hello *broken" };
+
+        await renderer.RenderAsync(bot, limiter, 42L, msg);
+
+        Assert.Single(bot.Requests);
+        Assert.NotEqual(ParseMode.Markdown, GetParseMode(bot.Requests[0]));
+        var text = bot.Requests[0].GetType().GetProperty("Text")?.GetValue(bot.Requests[0]) as string;
+        Assert.Equal("Hello broken", text);
     }
 
     [Fact]
