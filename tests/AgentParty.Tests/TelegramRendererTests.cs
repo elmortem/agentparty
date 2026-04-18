@@ -172,6 +172,57 @@ public class TelegramRendererTests
     }
 
     [Fact]
+    public async Task RenderListInfoItems_EscapesSpecialCharsInText()
+    {
+        var bot = new RecordingBotClient();
+        using var limiter = NoThrottleLimiter();
+        var renderer = new TelegramRenderer(new TelegramServerConfig { BotToken = "t" });
+        var list = new ListContent
+        {
+            Title = "Title_with_underscores",
+            Items = [new ListItem { Text = "item_one", Details = "detail*two" }]
+        };
+        var msg = new AgentParty.Message { Type = MessageTypes.List, Content = list.Serialize() };
+
+        await renderer.RenderAsync(bot, limiter, 42L, msg);
+
+        Assert.Single(bot.Requests);
+        var text = bot.Requests[0].GetType().GetProperty("Text")?.GetValue(bot.Requests[0]) as string;
+        Assert.NotNull(text);
+        Assert.Contains(@"Title\_with\_underscores", text);
+        Assert.Contains(@"item\_one", text);
+        Assert.Contains(@"detail\*two", text);
+    }
+
+    [Fact]
+    public async Task RenderListActionItems_EscapesSpecialCharsInText()
+    {
+        var bot = new RecordingBotClient();
+        using var limiter = NoThrottleLimiter();
+        var renderer = new TelegramRenderer(new TelegramServerConfig { BotToken = "t" });
+        var list = new ListContent
+        {
+            Items =
+            [
+                new ListItem
+                {
+                    Id = "a", Text = "Task_name", Details = "detail*here",
+                    Actions = [new ListAction { Id = "go", Label = "Go" }]
+                }
+            ]
+        };
+        var msg = new AgentParty.Message { Type = MessageTypes.List, Content = list.Serialize() };
+
+        await renderer.RenderAsync(bot, limiter, 42L, msg);
+
+        Assert.Single(bot.Requests);
+        var text = bot.Requests[0].GetType().GetProperty("Text")?.GetValue(bot.Requests[0]) as string;
+        Assert.NotNull(text);
+        Assert.Contains(@"Task\_name", text);
+        Assert.Contains(@"detail\*here", text);
+    }
+
+    [Fact]
     public async Task RenderNotificationThinking_SendsChatAction()
     {
         var bot = new RecordingBotClient();

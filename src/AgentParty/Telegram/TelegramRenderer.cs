@@ -67,12 +67,12 @@ public class TelegramRenderer
         {
             var lines = new List<string>();
             if (!string.IsNullOrEmpty(list.Title))
-                lines.Add($"*{list.Title}*");
+                lines.Add($"*{TelegramMarkdown.Escape(list.Title)}*");
             foreach (var item in infoItems)
             {
-                var line = $"• {item.Text}";
+                var line = $"• {TelegramMarkdown.Escape(item.Text)}";
                 if (!string.IsNullOrEmpty(item.Details))
-                    line += $" — {item.Details}";
+                    line += $" — {TelegramMarkdown.Escape(item.Details)}";
                 lines.Add(line);
             }
             await SendMessageSafeAsync(botClient, limiter, chatId, string.Join("\n", lines), null, cancellationToken);
@@ -80,9 +80,9 @@ public class TelegramRenderer
 
         foreach (var item in actionItems)
         {
-            var text = item.Text;
+            var text = TelegramMarkdown.Escape(item.Text);
             if (!string.IsNullOrEmpty(item.Details))
-                text += $"\n{item.Details}";
+                text += $"\n{TelegramMarkdown.Escape(item.Details)}";
 
             var buttons = item.Actions!
                 .Select(a => new[] { InlineKeyboardButton.WithCallbackData(a.Label, $"{item.Id}:{a.Id}") })
